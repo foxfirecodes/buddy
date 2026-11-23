@@ -22,7 +22,7 @@ pub struct Selection {
     pub settings: bool,
     pub source: Option<String>,
 }
-pub fn bind(local: &Local, sel: Selection) -> Result<()> {
+pub fn bind(local: &Local, sel: Selection, reviewed: Option<&Binding>) -> Result<()> {
     ensure!(
         key(&sel.game) && key(&sel.slot),
         "use letters, numbers, - or _ in IDs"
@@ -73,7 +73,7 @@ pub fn bind(local: &Local, sel: Selection) -> Result<()> {
     };
     let mut s = setup.unwrap_or_else(|| Setup::new(info.clone()));
     let mut draft = s.draft.clone().unwrap_or_else(|| Draft::new(info.clone()));
-    let binding = Binding::new(&sel.path, &sel.kind)?;
+    let binding = Binding::for_selection(&sel.path, &sel.kind, reviewed)?;
     let mut recipe = draft.desired.recipe.clone();
     let platform = runtime(&sel.game);
     let mut available = roots(&sel.game);
@@ -302,6 +302,11 @@ pub fn unbind(local: &Local, game: &str, slot: &str) -> Result<()> {
         s.bindings.remove(slot).is_some(),
         "selection is not bound on this device"
     );
+    if s.bindings.is_empty() {
+        s.bindings_cleared = true;
+        s.approved_proton_prefix = None;
+        s.needs_first_pull = false;
+    }
     rescope(&mut s);
     local.save(&c, &s)
 }

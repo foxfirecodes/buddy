@@ -22,13 +22,13 @@ use std::{
     time::Duration,
 };
 
-fn native(size: [f32; 2]) -> eframe::NativeOptions {
+pub(crate) fn native(size: [f32; 2]) -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size(size),
         ..Default::default()
     }
 }
-fn style(ctx: &egui::Context) {
+pub(crate) fn style(ctx: &egui::Context) {
     ctx.all_styles_mut(|s| {
         s.visuals.override_text_color = Some(if s.visuals.dark_mode {
             Color32::from_rgb(229, 231, 235)
@@ -89,7 +89,9 @@ pub fn decision_window() -> Result<i32> {
             ui.add_space(12.);
             ui.heading(&q.title);
             ui.add_space(12.);
-            ui.label(&q.message);
+            egui::ScrollArea::vertical()
+                .max_height((ui.available_height() - 66.).max(80.))
+                .show(ui, |ui| ui.label(&q.message));
             ui.add_space(18.);
             if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
                 focus = (focus + q.choices.len() - 1) % q.choices.len();
@@ -209,6 +211,7 @@ impl Progress {
 
 type Suggestions = Vec<(String, Kind, Option<PathBuf>)>;
 struct Detail {
+    cloud_history: bool,
     candidates: Vec<crate::manifest::Suggestion>,
     game: String,
     slots: Suggestions,
@@ -222,8 +225,111 @@ struct Detail {
     draft: bool,
     shared_options: Vec<(String, String)>,
 }
+#[derive(Clone, PartialEq)]
+struct PreviewKey {
+    game: String,
+    path: PathBuf,
+    kind: Kind,
+    slot: String,
+}
+
+#[derive(Default)]
+struct SelectionPreview {
+    key: Option<PreviewKey>,
+    since: Option<std::time::Instant>,
+    worker: Option<mpsc::Receiver<Result<crate::files::Preview, String>>>,
+    result: Option<Result<crate::files::Preview, String>>,
+    cancel: Option<mpsc::Sender<()>>,
+}
+
+impl SelectionPreview {
+    fn render(&mut self, ui: &mut egui::Ui, home: &Path, key: PreviewKey) -> Option<&Binding> {
+        if self.key.as_ref() != Some(&key) {
+            *self = Self {
+                key: Some(key.clone()),
+                since: Some(std::time::Instant::now()),
+                ..Self::default()
+            };
+        }
+        if key.path.as_os_str().is_empty() || !crate::model::key(&key.slot) {
+            return None;
+        }
+        if self
+            .since
+            .is_some_and(|start| start.elapsed() >= Duration::from_millis(300))
+        {
+            let (tx, rx) = mpsc::channel();
+            let (alive, cancellation) = mpsc::channel::<()>();
+            let home = home.to_owned();
+            thread::spawn(move || {
+                let res = crate::files::preview(&home, &key.path, key.kind, &key.slot, || {
+                    cancellation.try_recv() == Err(mpsc::TryRecvError::Disconnected)
+                });
+                let _ = tx.send(res.map_err(|e| format!("{e:#}")));
+            });
+            self.cancel = Some(alive);
+            self.worker = Some(rx);
+            self.since = None;
+        }
+        if let Some(rx) = &self.worker {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.result = Some(result);
+                    self.worker = None;
+                    self.cancel = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.result = Some(Err("File preview stopped".into()));
+                    self.worker = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        match &self.result {
+            Some(Ok(p)) => {
+                let count = p.files.len();
+                let unit = if count == 1 { "file" } else { "files" };
+                let total = if p.bytes < 1024 * 1024 {
+                    format!("{} bytes", p.bytes)
+                } else {
+                    format!("{:.2} MiB ({} bytes)", p.bytes as f64 / 1048576., p.bytes)
+                };
+                ui.label(format!("{count} {unit} · {total}"));
+                if p.files.is_empty() {
+                    ui.small("This selection is currently empty.");
+                } else {
+                    egui::CollapsingHeader::new("Included files")
+                        .id_salt("selected-files")
+                        .show(ui, |ui| {
+                            let height = ui.text_style_height(&egui::TextStyle::Body);
+                            egui::ScrollArea::vertical()
+                                .id_salt("file-list")
+                                .max_height(130.)
+                                .show_rows(ui, height, p.files.len(), |ui, range| {
+                                    for name in &p.files[range] {
+                                        ui.label(name);
+                                    }
+                                });
+                        });
+                }
+                Some(&p.binding)
+            }
+            Some(Err(error)) => {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+                None
+            }
+            None => {
+                ui.label("Counting files…");
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+                None
+            }
+        }
+    }
+}
 enum Event {
     Signed(Vec<Row>),
+    Catalog(String),
+    Bound,
     Games(Vec<Row>),
     Detail(Box<Detail>),
     Done(String),
@@ -241,6 +347,7 @@ struct App {
     device: String,
     invite: String,
     register: bool,
+    pairing: Option<crate::host::Pairing>,
     private_file: bool,
     games: Vec<Row>,
     filter: String,
@@ -249,6 +356,7 @@ struct App {
     title: String,
     slot: String,
     path: String,
+    preview: SelectionPreview,
     file: bool,
     settings: bool,
     source: Option<String>,
@@ -264,6 +372,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let c = local.credentials().ok();
         let signed = c.is_some();
+        let pairing = c.as_ref().and_then(crate::host::Pairing::remembered);
         let mut app = Self {
             local,
             tx,
@@ -279,6 +388,7 @@ impl App {
             device: c.map(|c| c.device).unwrap_or_else(default_device),
             invite: String::new(),
             register: false,
+            pairing,
             private_file: false,
             games: vec![],
             filter: String::new(),
@@ -287,6 +397,7 @@ impl App {
             title: String::new(),
             slot: "saves".into(),
             path: String::new(),
+            preview: SelectionPreview::default(),
             file: false,
             settings: false,
             source: None,
@@ -358,6 +469,7 @@ impl App {
                 }
             }
             let d = Detail {
+                cloud_history: crate::local::has_cloud_history(&game),
                 shared_options,
                 candidates: crate::manifest::candidates(&l, &game)?,
                 roots: available.into_iter().collect(),
@@ -380,6 +492,7 @@ impl App {
         self.selected = game;
         self.title = title;
         self.path.clear();
+        self.preview = SelectionPreview::default();
         self.source = None;
         self.slot = "saves".into();
         self.detail = None;
@@ -389,7 +502,29 @@ impl App {
         ui.set_max_width(470.);
         ui.heading("Connect to Buddy");
         ui.add_space(12.);
-        field(ui, "Server URL", &mut self.url);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Open server pairing file…").clicked()
+                && let Some(file) = rfd::FileDialog::new()
+                    .add_filter("Buddy pairing", &["json"])
+                    .pick_file()
+            {
+                self.import_pairing(&file);
+            }
+            let own = crate::host::pair_path(&self.local);
+            if own.is_file() && ui.button("Use my hosted server").clicked() {
+                self.import_pairing(&own);
+            }
+        });
+        if let Some(pair) = &self.pairing {
+            ui.label(&pair.url);
+            ui.monospace(format!("Paired host · {}", pair.fingerprint()));
+            if ui.small_button("Use another server").clicked() {
+                self.pairing = None;
+                self.url.clear();
+            }
+        } else {
+            field(ui, "Server URL", &mut self.url);
+        }
         field(ui, "Account", &mut self.account);
         ui.label("Password");
         ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
@@ -414,10 +549,45 @@ impl App {
                 invite: self.register.then(|| std::mem::take(&mut self.invite)),
             };
             let private_file = self.private_file;
+            let pairing = self.pairing.clone();
             self.job(move |l| {
-                l.set_login(&Api::login(&url, login)?, private_file)?;
+                l.set_login(
+                    &Api::login_paired(&url, login, pairing.as_ref())?,
+                    private_file,
+                )?;
                 Ok(Event::Signed(setup::games(&l)?))
             });
+        }
+    }
+    fn finished(&mut self, s: String) {
+        if let Some(r) = self.games.iter_mut().find(|r| r.id == self.selected) {
+            r.local = true;
+            r.mine = true;
+        } else {
+            self.games.push(Row {
+                id: self.selected.clone(),
+                title: self.title.clone(),
+                local: true,
+                mine: true,
+                installed: false,
+                shared: false,
+            });
+        }
+        self.load();
+        self.note = s;
+    }
+    fn import_pairing(&mut self, path: &Path) {
+        match crate::host::Pairing::load(path) {
+            Ok(pair) => {
+                self.url = pair.url.clone();
+                self.pairing = Some(pair);
+                self.error = false;
+                self.note.clear();
+            }
+            Err(e) => {
+                self.error = true;
+                self.note = format!("{e:#}");
+            }
         }
     }
     fn library(&mut self, ui: &mut egui::Ui) {
@@ -464,6 +634,38 @@ impl App {
             self.select(format!("custom-{}", id()), String::new());
         }
     }
+    fn launch_fields(&mut self, ui: &mut egui::Ui, game: &str) {
+        let fields = std::env::current_exe()
+            .map_err(anyhow::Error::from)
+            .and_then(|exe| {
+                crate::steam_launch::LaunchFields::new(
+                    &exe,
+                    self.local
+                        .explicit_home
+                        .then_some(self.local.home.as_path()),
+                    game,
+                )
+            });
+        match fields {
+            Ok(f) if f.store_title => {
+                if ui.button("Copy launch options").clicked() {
+                    ui.ctx().copy_text(f.options);
+                    self.note = "Steam launch options copied".into();
+                }
+            }
+            Ok(f) => {
+                ui.collapsing("Launch as a non-Steam shortcut", |ui| {
+                    ui.label("Save the shortcut’s original Target and Launch Options. Keep its Start In directory.");
+                    if ui.button("Copy new Target").clicked(){ui.ctx().copy_text(f.target);}
+                    if ui.button("Copy Launch Options prefix").clicked(){ui.ctx().copy_text(f.options);}
+                    ui.label("After the prefix, paste the original Target in quotes, followed by its original arguments.");
+                });
+            }
+            Err(e) => {
+                ui.label(format!("Unable to format Steam launch options: {e}"));
+            }
+        }
+    }
     fn game(&mut self, ui: &mut egui::Ui) {
         if self.selected.is_empty() {
             ui.heading("Select a game");
@@ -503,8 +705,12 @@ impl App {
                 );
                 if ui
                     .selectable_label(self.path == candidate.path.display().to_string(), label)
+                    .on_hover_text(&candidate.source)
                     .clicked()
                 {
+                    if let Some(slot) = candidate.slot {
+                        self.slot = slot.to_owned();
+                    }
                     self.path = candidate.path.display().to_string();
                     self.file = candidate.kind == Kind::File;
                     self.settings = candidate.settings;
@@ -587,12 +793,36 @@ impl App {
             }
         });
         field(ui, "Selection name", &mut self.slot);
+        if let Some(source) = &self.source {
+            ui.label(source);
+        }
+        if game.starts_with("steam-") && !self.path.is_empty() {
+            if self.detail.as_ref().is_some_and(|d| d.cloud_history) {
+                ui.label("Steam has Cloud records for this game. If both services sync these files, disable Steam Cloud for the game on each device in Steam Properties, under General.");
+            } else {
+                ui.collapsing("Steam Cloud overlap", |ui| {
+                    ui.label("If this game uses Steam Cloud for these files, choose one sync service per file. You can disable Cloud for the game in Steam Properties, under General.");
+                });
+            }
+        }
+        let reviewed = self.preview.render(
+            ui,
+            &self.local.home,
+            PreviewKey {
+                game: game.clone(),
+                path: PathBuf::from(&self.path),
+                kind: if self.file { Kind::File } else { Kind::Folder },
+                slot: self.slot.clone(),
+            },
+        );
+
         if ui
             .add_enabled(
-                !self.path.is_empty() && !self.title.trim().is_empty(),
+                reviewed.is_some() && !self.title.trim().is_empty(),
                 egui::Button::new("Save selection"),
             )
             .clicked()
+            && let Some(binding) = reviewed.cloned()
         {
             let sel = Selection {
                 game: game.clone(),
@@ -603,11 +833,9 @@ impl App {
                 settings: self.settings,
                 source: self.source.clone(),
             };
-            self.path.clear();
-            self.source = None;
             self.job(move |l| {
-                setup::bind(&l, sel)?;
-                Ok(Event::Done("Selection saved".into()))
+                setup::bind(&l, sel, Some(&binding))?;
+                Ok(Event::Bound)
             });
         }
         ui.collapsing("Custom root directories", |ui| {
@@ -656,6 +884,11 @@ impl App {
             });
         }
         if !configured {
+            #[cfg(target_os = "linux")]
+            if game.starts_with("steam-") {
+                ui.small("For a new Proton installation, copy the launch options and press Play in Steam to initialize its prefix.");
+                self.launch_fields(ui, &game);
+            }
             return;
         }
         ui.add_space(8.);
@@ -687,36 +920,7 @@ impl App {
                 self.sync(None, true);
             }
         });
-        let fields = std::env::current_exe()
-            .map_err(anyhow::Error::from)
-            .and_then(|exe| {
-                crate::steam_launch::LaunchFields::new(
-                    &exe,
-                    self.local
-                        .explicit_home
-                        .then_some(self.local.home.as_path()),
-                    &game,
-                )
-            });
-        match fields {
-            Ok(f) if f.store_title => {
-                if ui.button("Copy launch options").clicked() {
-                    ui.ctx().copy_text(f.options);
-                    self.note = "Steam launch options copied".into();
-                }
-            }
-            Ok(f) => {
-                ui.collapsing("Launch as a non-Steam shortcut", |ui| {
-                    ui.label("Save the shortcut’s original Target and Launch Options. Keep its Start In directory.");
-                    if ui.button("Copy new Target").clicked(){ui.ctx().copy_text(f.target);}
-                    if ui.button("Copy Launch Options prefix").clicked(){ui.ctx().copy_text(f.options);}
-                    ui.label("After the prefix, paste the original Target in quotes, followed by its original arguments.");
-                });
-            }
-            Err(e) => {
-                ui.label(format!("Unable to format Steam launch options: {e}"));
-            }
-        }
+        self.launch_fields(ui, &game);
         egui::CollapsingHeader::new("Backups").show(ui, |ui| {
             let list = self
                 .detail
@@ -884,6 +1088,12 @@ impl eframe::App for App {
                     self.games = g;
                 }
                 Ok(Event::Games(g)) => self.games = g,
+                Ok(Event::Catalog(msg)) => {
+                    if !self.selected.is_empty() {
+                        self.load();
+                    }
+                    self.note = msg;
+                }
                 Ok(Event::Detail(d)) => {
                     if d.game == self.selected {
                         self.launcher = d.launcher.clone().unwrap_or_default();
@@ -898,23 +1108,16 @@ impl eframe::App for App {
                     }
                 }
                 Ok(Event::Done(s)) => {
-                    if let Some(r) = self.games.iter_mut().find(|r| r.id == self.selected) {
-                        r.local = true;
-                        r.mine = true;
-                    } else {
-                        self.games.push(Row {
-                            id: self.selected.clone(),
-                            title: self.title.clone(),
-                            local: true,
-                            mine: true,
-                            installed: false,
-                            shared: false,
-                        });
-                    }
-                    self.load();
-                    self.note = s;
+                    self.finished(s);
+                }
+                Ok(Event::Bound) => {
+                    self.path.clear();
+                    self.source = None;
+                    self.preview = SelectionPreview::default();
+                    self.finished("Selection saved".into());
                 }
                 Err(e) => {
+                    self.preview = SelectionPreview::default();
                     self.note = e;
                     self.error = true;
                 }
@@ -923,6 +1126,26 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Buddy").size(24.).strong());
+                if ui.button("Host server…").clicked() {
+                    let opened = (|| -> Result<()> {
+                        let mut cmd = Command::new(std::env::current_exe()?);
+                        if self.local.explicit_home {
+                            cmd.arg("--profile-dir").arg(&self.local.home);
+                        }
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::process::CommandExt;
+                            use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+                            cmd.creation_flags(CREATE_NO_WINDOW);
+                        }
+                        cmd.arg("host").spawn()?;
+                        Ok(())
+                    })();
+                    if let Err(e) = opened {
+                        self.error = true;
+                        self.note = e.to_string();
+                    }
+                }
                 if self.signed {
                     ui.separator();
                     ui.label(format!("{} · {}", self.account, self.device));
@@ -932,18 +1155,32 @@ impl eframe::App for App {
                     {
                         self.refresh();
                     }
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("Import path catalog…"))
-                        .clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Ludusavi manifest", &["yaml", "yml"])
-                            .pick_file()
-                    {
-                        self.job(move |l| {
-                            crate::manifest::import(&l, &path)?;
-                            Ok(Event::Games(setup::games(&l)?))
-                        });
-                    }
+                    ui.menu_button("Path suggestions", |ui| {
+                        if ui
+                            .add_enabled(!self.busy, egui::Button::new("Download from Ludusavi"))
+                            .clicked()
+                        {
+                            ui.close();
+                            self.job(|l| Ok(Event::Catalog(crate::manifest::download(&l)?)));
+                        }
+                        if ui
+                            .add_enabled(!self.busy, egui::Button::new("Import local YAML…"))
+                            .clicked()
+                        {
+                            ui.close();
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Ludusavi manifest", &["yaml", "yml"])
+                                .pick_file()
+                            {
+                                self.job(move |l| {
+                                    Ok(Event::Catalog(format!(
+                                        "Indexed {} games.",
+                                        crate::manifest::import(&l, &path)?
+                                    )))
+                                });
+                            }
+                        }
+                    });
                     if ui
                         .add_enabled(!self.busy, egui::Button::new("Switch account"))
                         .clicked()
@@ -1015,9 +1252,18 @@ pub fn tui(l: &Local) -> Result<()> {
             return Ok(());
         }
         if item == "Sign in" {
-            let url = Text::new("Server URL")
-                .with_default("http://127.0.0.1:7341")
-                .prompt()?;
+            let path = Text::new("Server pairing file (blank to enter a URL)").prompt()?;
+            let pairing = (!path.is_empty())
+                .then(|| crate::host::Pairing::load(Path::new(&path)))
+                .transpose()?;
+            let url = if let Some(p) = &pairing {
+                println!("{} · {}", p.url, p.fingerprint());
+                p.url.clone()
+            } else {
+                Text::new("Server URL")
+                    .with_default("http://127.0.0.1:7341")
+                    .prompt()?
+            };
             let account = Text::new("Account").prompt()?;
             let password = Password::new("Password").without_confirmation().prompt()?;
             let invite = Text::new("Invite (blank for existing account)").prompt()?;
@@ -1029,7 +1275,7 @@ pub fn tui(l: &Local) -> Result<()> {
                     .with_default(false)
                     .prompt()?;
             l.set_login(
-                &Api::login(
+                &Api::login_paired(
                     &url,
                     Login {
                         account,
@@ -1037,6 +1283,7 @@ pub fn tui(l: &Local) -> Result<()> {
                         device,
                         invite: (!invite.is_empty()).then_some(invite),
                     },
+                    pairing.as_ref(),
                 )?,
                 private_file,
             )?;
@@ -1099,6 +1346,7 @@ pub fn tui(l: &Local) -> Result<()> {
                         settings: false,
                         source: None,
                     },
+                    None,
                 )?;
             }
             "Sync" | "Back up now" => {

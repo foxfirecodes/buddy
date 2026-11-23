@@ -2,6 +2,7 @@
 
 Buddy syncs selected game saves and settings between devices. The native Rust app includes the graphical client, command-line and terminal clients, Steam wrapper, and control server. The desktop sync prototype is ready for a trial with a disposable world.
 
+- [Set up Buddy on your home network](docs/onboarding.md) to host an HTTPS server, pair a second device, and preview the files you want to sync.
 - [Run the sync client and server](docs/sync.md) for setup, a two-device walkthrough, backups, and recovery.
 - [Test from Windows Steam](docs/windows-steam.md) using the disposable Windows kit and optional Dockur guest.
 - [Read the product and protocol spec](SPEC.md) for design decisions and planned features.

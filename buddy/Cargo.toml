@@ -10,6 +10,9 @@ buddy-process = {path="../process"}
 anyhow = "1"
 argon2 = "0.5"
 axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+rcgen = "0.14"
+rustls = {version = "0.23", default-features = false, features = ["ring", "std"]}
 blake3 = "1"
 cap-std = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -39,3 +42,4 @@ rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi-util = "0.1"
+windows-sys = { version="0.61", features=["Win32_Foundation", "Win32_Security_Authorization", "Win32_System_Threading"] }

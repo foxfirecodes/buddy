@@ -1,6 +1,13 @@
-# Use a TLS reverse proxy in front of this listener for other devices.
+# Loopback HTTP can sit behind a TLS reverse proxy. The graphical Host server window
+# generates a LAN HTTPS configuration and a pairing file for other devices.
 listen = "127.0.0.1:7341"
 database = "buddy-data/server.sqlite3"
 
 # Optional physical chunk allowance per account, in bytes.
 # account_quota_bytes = 107374182400
+
+# For a manually managed HTTPS listener, set listen above to the desired IP:port
+# and enable this section. Paths are relative to this settings file.
+# [tls]
+# certificate = "server-chain.pem"
+# private_key = "server-key.pem"

@@ -25,6 +25,13 @@ struct Config {
     listen: SocketAddr,
     database: PathBuf,
     account_quota_bytes: Option<u64>,
+    tls: Option<TlsFiles>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TlsFiles {
+    certificate: PathBuf,
+    private_key: PathBuf,
 }
 #[derive(Clone)]
 pub struct Store(PathBuf, Option<u64>);
@@ -170,10 +177,19 @@ fn check_quota(tx: &Transaction, s: &Store, account: &str) -> Result<()> {
     Ok(())
 }
 pub fn serve(path: &Path) -> Result<()> {
+    serve_controlled(path, axum_server::Handle::new(), |addr| {
+        eprintln!("Buddy listening on {addr}")
+    })
+}
+pub fn serve_controlled(
+    path: &Path,
+    handle: axum_server::Handle<SocketAddr>,
+    ready: impl FnOnce(SocketAddr),
+) -> Result<()> {
     let (s, cfg) = Store::open(path)?;
     ensure!(
-        cfg.listen.ip().is_loopback(),
-        "set listen to a loopback address and use an HTTPS reverse proxy for remote devices"
+        cfg.tls.is_some() || cfg.listen.ip().is_loopback(),
+        "set listen to a loopback address for HTTP, or configure a TLS certificate and private key"
     );
     tokio::runtime::Runtime::new()?.block_on(async move {
         let maintenance = s.clone();
@@ -205,13 +221,24 @@ pub fn serve(path: &Path) -> Result<()> {
             )
             .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
             .with_state(s);
-        let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
-        eprintln!("Buddy listening on {}", listener.local_addr()?);
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await?;
+        let listener = std::net::TcpListener::bind(cfg.listen)?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        let service = app.into_make_service_with_connect_info::<SocketAddr>();
+        if let Some(tls) = cfg.tls {
+            let dir = path.parent().unwrap_or(Path::new("."));
+            let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                dir.join(tls.certificate),
+                dir.join(tls.private_key),
+            )
+            .await?;
+            let server = axum_server::from_tcp_rustls(listener, tls)?.handle(handle);
+            ready(addr);
+            server.serve(service).await?;
+        } else {
+            ready(addr);
+            axum::serve(tokio::net::TcpListener::from_std(listener)?, service).await?;
+        }
         Ok(())
     })
 }

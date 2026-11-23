@@ -6,7 +6,7 @@ Use a disposable world for the first run. Buddy can replace selected files on a 
 
 This workspace also contains ready-built x86-64 executables. Use `target/release/buddy` on this desktop, `target/x86_64-unknown-linux-gnu/release/buddy` for the portable Linux build, and `target/x86_64-pc-windows-gnullvm/release/buddy.exe` on Windows. For the Deck sync trial, copy the portable Linux file to `~/Downloads/buddy`, switch to Desktop Mode and run `install -Dm755 ~/Downloads/buddy ~/.local/bin/buddy` followed by `~/.local/bin/buddy`. It targets glibc 2.28. The Game Mode exit experiment uses the separate `buddy-probe` binary.
 
-From the repository on the desktop, run these commands in a terminal. The invite printed by the second command is valid for one new account for 24 hours.
+For graphical hosting on your home network, choose **Host server…** in Buddy and follow the [pairing walkthrough](onboarding.md). For the headless loopback setup, run these commands in a terminal. The invite printed by the second command is valid for one new account for 24 hours.
 
 ```sh
 cargo build --release --locked -p buddy
@@ -18,7 +18,7 @@ Keep the server terminal open. In another terminal run `target/release/buddy`. E
 
 The shipped TOML puts the database, including file chunks, under `buddy-data/` next to the settings file. To use another location, copy the TOML, edit `database`, and pass that file to both commands. Normal sign-in uses the OS credential vault. If the device lacks an unlocked vault, **Credential storage** offers an explicit private-file option. On a shared PC, use separate OS accounts for different players. A local OS user able to read the server database can read its saves.
 
-For a second machine, either put a TLS reverse proxy with a client-trusted certificate in front of the loopback listener or use an SSH tunnel for the trial. With SSH access to the desktop, run this on the second machine and keep it open:
+With the headless loopback configuration, you can put a TLS reverse proxy in front of the listener or use an SSH tunnel. The graphical host serves HTTPS directly. With SSH access to the desktop, run this on the second machine and keep it open:
 
 ```sh
 ssh -N -L 127.0.0.1:7341:127.0.0.1:7341 YOUR_DESKTOP_USER@YOUR_DESKTOP_HOST
@@ -34,6 +34,8 @@ Both clients can then use `http://127.0.0.1:7341`. Stick with the same URL on ea
 4. For a Steam game, search by title or app ID, select the save files, then **Copy launch options** into Steam's **Properties → General → Launch Options**. A typical entry is `"/absolute/path/to/buddy" run --game steam-12345 -- %command%`. Keep any existing wrapper or game flags with the original command. On the other device copy that device's launch options. The file chooser offers home, Steam install and existing Proton prefix shortcuts. Discovery visits registered libraries across drives.
 5. For a non-Steam shortcut inside Steam, expand **Launch as a non-Steam shortcut**. Copy the new Target and the Launch Options prefix. Append the original quoted executable and its arguments to the prefix, and preserve the original Start In directory. For a non-Steam game outside Steam, open **Advanced → Launch a game directly**, choose the executable, working directory, and arguments, then **Save launcher**. Use **Play** in Buddy. These launcher details stay on that device. A launch that hands off to an already-running process can use **Ask me when the game has closed**.
 6. To test offline play, close the game, stop the server or tunnel and use the configured launch command. Choose **Play offline**, change the test save and quit. Restart the connection and launch or sync again. The client compares its queued session against the server. **Decide later** keeps the data available for another attempt.
+
+For a freshly installed Proton title with saves already on the server, Buddy can initialize its prefix and restore your selections on the first Play. [First Play with Proton](proton-first-play.md)
 
 Each selection has an ID such as `saves` or `settings` that maps to a path on each device. For a second selection, choose a new ID. A platform-specific settings file can have a separate ID that only the relevant devices bind. **Stop syncing here** detaches a selection on that device and preserves the files and server history. Custom named roots such as `instance` can point to unrelated absolute directories on each device. Define the root before selecting its files so the recipe can record the relative path. Directories must exist when bound. You can bind an absent single file if its parent exists.
 
@@ -61,7 +63,7 @@ buddy policy minecraft --retention 3 --shared false
 buddy unbind minecraft settings
 ```
 
-Use `buddy sync GAME --interactive` for terminal conflict choices. The default CLI sync stops if a human decision is required. Steam's `run` always opens graphical decisions. Choose **Use shared recipe** in the game view to copy a published recipe. If several people have published different recipes for the same game, `buddy catalog` lists their hashes and `buddy import GAME HASH` copies the one you choose. `buddy load-manifest FILE.yaml` indexes a locally provided Ludusavi catalog. **Import path catalog…** does the same in the GUI. Candidates need approval on this device. The executable ships without a path dataset. The [spec](../SPEC.md) records the format and data licensing sources.
+Use `buddy sync GAME --interactive` for terminal conflict choices. The default CLI sync stops if a human decision is required. Steam's `run` always opens graphical decisions. Choose **Use shared recipe** in the game view to copy a published recipe. If several people have published different recipes for the same game, `buddy catalog` lists their hashes and `buddy import GAME HASH` copies the one you choose. `buddy load-manifest FILE.yaml` indexes a locally provided Ludusavi catalog. **Path suggestions** offers both local YAML import and an optional download directly from Ludusavi. Buddy includes its own vanilla Terraria and Starbound recipes. Select a candidate to preview and approve the files on this device. The [spec](../SPEC.md) records the format and data licensing sources.
 
 ## Recovery and test coverage
 

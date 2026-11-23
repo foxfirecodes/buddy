@@ -43,6 +43,14 @@ fn anchor(path: &Path, kind: &Kind) -> Result<PathBuf> {
     })
 }
 impl Binding {
+    pub fn for_selection(path: &Path, kind: &Kind, reviewed: Option<&Self>) -> Result<Self> {
+        let actual = Self::new(path, kind)?;
+        ensure!(
+            reviewed.is_none_or(|prior| prior == &actual),
+            "selected root changed after preview; review the files again"
+        );
+        Ok(actual)
+    }
     pub fn new(path: &Path, kind: &Kind) -> Result<Self> {
         let path = std::path::absolute(path)?;
         let root = anchor(&path, kind)?
@@ -133,6 +141,121 @@ struct Root {
     base: PathBuf,
     kind: Kind,
     anchor: PathBuf,
+}
+impl Root {
+    fn walk(
+        &self,
+        slot: &str,
+        stage: Option<&str>,
+        mut visit: impl FnMut(String, PathBuf, cap_std::fs::Metadata) -> Result<()>,
+    ) -> Result<()> {
+        let mut todo = vec![(slot.to_owned(), self.base.clone())];
+        while let Some((logical, path)) = todo.pop() {
+            let meta = match self.dir.symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(e)
+                    if e.kind() == ErrorKind::NotFound
+                        && logical == slot
+                        && self.kind == Kind::File =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            ensure!(
+                !meta.file_type().is_symlink(),
+                "symlink in selection: {logical}"
+            );
+            #[cfg(windows)]
+            {
+                use cap_std::fs::MetadataExt;
+                ensure!(
+                    meta.file_attributes() & 0x400 == 0,
+                    "reparse point in selection: {logical}"
+                );
+            }
+            if meta.is_dir() {
+                let names = dir_names(&self.dir, &path)?;
+                for name in &names {
+                    if path == self.base && stage == Some(name) {
+                        continue;
+                    }
+                    component(name)?;
+                    todo.push((format!("{logical}/{name}"), path.join(name)));
+                }
+            } else {
+                ensure!(meta.is_file(), "special file in selection: {logical}");
+            }
+            visit(logical, path, meta)?;
+        }
+        Ok(())
+    }
+}
+
+pub struct Preview {
+    pub binding: Binding,
+    pub files: Vec<String>,
+    pub bytes: u64,
+}
+pub fn preview(
+    home: &Path,
+    path: &Path,
+    kind: Kind,
+    slot: &str,
+    cancelled: impl Fn() -> bool,
+) -> Result<Preview> {
+    let binding = Binding::new(path, &kind)?;
+    let label = binding
+        .path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let recipe = Recipe {
+        game: "preview".into(),
+        title: "Selection".into(),
+        retention: 0,
+        slots: BTreeMap::from([(
+            slot.to_owned(),
+            Slot {
+                kind,
+                codec: raw_codec(),
+                source: None,
+                settings: false,
+                locations: BTreeMap::new(),
+            },
+        )]),
+    };
+    let files = Files::open(
+        &recipe,
+        &BTreeMap::from([(slot.to_owned(), binding.clone())]),
+        home,
+    )?;
+    let mut result = Preview {
+        binding,
+        files: vec![],
+        bytes: 0,
+    };
+    let mut names = BTreeSet::new();
+    files.roots[slot].walk(slot, None, |logical, _, meta| {
+        ensure!(!cancelled(), "preview cancelled");
+        portable_path(&logical, &mut names)?;
+        if meta.is_file() {
+            result.bytes = result
+                .bytes
+                .checked_add(meta.len())
+                .context("selection size overflow")?;
+            result.files.push(
+                logical
+                    .split_once('/')
+                    .map_or(label.as_str(), |(_, name)| name)
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    })?;
+    result.files.sort();
+    Ok(result)
 }
 fn same_file_state(a: &cap_std::fs::Metadata, b: &cap_std::fs::Metadata) -> Result<bool> {
     if !a.is_file() || !b.is_file() || a.len() != b.len() || a.modified()? != b.modified()? {
@@ -251,43 +374,10 @@ impl Files {
         let mut tree = Tree::default();
         let mut stamps = BTreeMap::new();
         for (slot, root) in &self.roots {
-            let mut todo = vec![(slot.clone(), root.base.clone())];
-            while let Some((logical, path)) = todo.pop() {
-                let meta = match root.dir.symlink_metadata(&path) {
-                    Ok(m) => m,
-                    Err(e)
-                        if e.kind() == ErrorKind::NotFound
-                            && logical == *slot
-                            && root.kind == Kind::File =>
-                    {
-                        continue;
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-                ensure!(
-                    !meta.file_type().is_symlink(),
-                    "symlink in selection: {logical}"
-                );
-                #[cfg(windows)]
-                {
-                    use cap_std::fs::MetadataExt;
-                    ensure!(
-                        meta.file_attributes() & 0x400 == 0,
-                        "reparse point in selection: {logical}"
-                    );
-                }
+            root.walk(slot, stage, |logical, path, meta| {
                 let entry = if meta.is_dir() {
-                    let names = dir_names(&root.dir, &path)?;
-                    for name in &names {
-                        if path == root.base && stage == Some(name) {
-                            continue;
-                        }
-                        component(name)?;
-                        todo.push((format!("{logical}/{name}"), path.join(name)));
-                    }
                     Entry::Directory
                 } else {
-                    ensure!(meta.is_file(), "special file in selection: {logical}");
                     let stamp = root.volume.stamp(&meta);
                     let absolute = root.anchor.join(&path);
                     let old = if allow_hints {
@@ -321,7 +411,8 @@ impl Files {
                     entry
                 };
                 tree.0.insert(logical, entry);
-            }
+                Ok(())
+            })?;
         }
         tree.validate(recipe)?;
         // Detect additions, removals and edits that occurred elsewhere in the tree during the read.
@@ -539,4 +630,53 @@ pub struct Restore {
     pub op: String,
     pub before: Tree,
     pub after: Tree,
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    #[test]
+    fn replaced_root_requires_a_new_preview() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("drive");
+        let home = tmp.path().join("profile");
+        fs::create_dir(&path)?;
+        fs::write(path.join("old.world"), b"first")?;
+        let before = preview(&home, &path, Kind::Folder, "saves", || false)?;
+        fs::rename(&path, tmp.path().join("removed-drive"))?;
+        fs::create_dir(&path)?;
+        fs::write(path.join("other.world"), b"second")?;
+        assert!(Binding::for_selection(&path, &Kind::Folder, Some(&before.binding)).is_err());
+        let after = preview(&home, &path, Kind::Folder, "saves", || false)?;
+        assert_eq!(after.files, ["other.world"]);
+        Binding::for_selection(&path, &Kind::Folder, Some(&after.binding))?;
+        Ok(())
+    }
+    #[test]
+    fn inventories_real_files_and_checks_portability() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join("save");
+        fs::create_dir_all(dir.join("player"))?;
+        fs::write(dir.join("world"), b"data")?;
+        fs::write(dir.join("player/character"), b"avatar")?;
+        let home = tmp.path().join("client");
+        let read = |p: &Path, kind| preview(&home, p, kind, "saves", || false);
+        let result = read(&dir, Kind::Folder)?;
+        assert_eq!(result.files, ["player/character", "world"]);
+        assert_eq!(result.bytes, 10);
+        assert_eq!(read(&dir.join("world"), Kind::File)?.files, ["world"]);
+        assert!(read(&dir.join("missing"), Kind::File)?.files.is_empty());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&home, dir.join("outside"))?;
+            assert!(read(&dir, Kind::Folder).is_err());
+            fs::remove_file(dir.join("outside"))?;
+            fs::write(dir.join("WORLD"), b"second")?;
+            if dir.join("world").metadata()?.len() == 4 {
+                assert!(read(&dir, Kind::Folder).is_err());
+            }
+        }
+        assert!(preview(&home, &dir, Kind::Folder, "saves", || true).is_err());
+        Ok(())
+    }
 }

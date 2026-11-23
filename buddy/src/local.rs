@@ -36,6 +36,12 @@ pub struct Pending {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Setup {
     #[serde(default)]
+    pub needs_first_pull: bool,
+    #[serde(default)]
+    pub bindings_cleared: bool,
+    #[serde(default)]
+    pub approved_proton_prefix: Option<PathBuf>,
+    #[serde(default)]
     pub draft: Option<crate::setup::Draft>,
     pub recipe: Recipe,
     pub revision: i64,
@@ -58,6 +64,9 @@ impl Setup {
     pub fn new(info: GameInfo) -> Self {
         Self {
             draft: None,
+            needs_first_pull: false,
+            bindings_cleared: false,
+            approved_proton_prefix: None,
             recipe: info.recipe,
             revision: info.revision,
             shared: info.shared,
@@ -159,14 +168,23 @@ impl Local {
         self.write("login", &record)
     }
     pub fn scope(&self, c: &Credentials) -> String {
-        digest(format!("{}\n{}", c.url, c.account).as_bytes())
+        // Replacing a hosted server's identity starts a different local history even if its URL is reused.
+        let mut scope = format!("{}\n{}", c.url, c.account);
+        if let Some(ca) = &c.paired_ca {
+            scope.push('\n');
+            scope.push_str(&digest(ca.replace('\r', "").as_bytes()));
+        }
+        digest(scope.as_bytes())
     }
     fn game_key(&self, c: &Credentials, g: &str) -> String {
         format!("game/{}/{}", self.scope(c), g)
     }
     pub fn setup(&self, c: &Credentials, g: &str) -> Result<Setup> {
-        self.read(&self.game_key(c, g))?
+        self.maybe_setup(c, g)?
             .context("configure this game on this device first")
+    }
+    pub fn maybe_setup(&self, c: &Credentials, g: &str) -> Result<Option<Setup>> {
+        self.read(&self.game_key(c, g))
     }
     pub fn setups(&self, c: &Credentials) -> Result<Vec<Setup>> {
         let db = self.db()?;
@@ -310,8 +328,14 @@ pub struct Api {
     pub c: Credentials,
     client: Client,
 }
-fn http() -> Result<Client> {
-    Ok(Client::builder()
+fn http(paired_ca: Option<&str>) -> Result<Client> {
+    let mut builder = Client::builder();
+    if let Some(ca) = paired_ca {
+        builder = builder
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(reqwest::Certificate::from_pem(ca.as_bytes())?);
+    }
+    Ok(builder
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(4))
         .timeout(Duration::from_secs(90))
@@ -376,10 +400,24 @@ pub fn unreachable(e: &anyhow::Error) -> bool {
     })
 }
 impl Api {
-    pub fn login(url: &str, login: Login) -> Result<Credentials> {
+    pub fn login_paired(
+        url: &str,
+        login: Login,
+        pair: Option<&crate::host::Pairing>,
+    ) -> Result<Credentials> {
         let url = canonical_url(url)?;
+        let paired_ca = if let Some(pair) = pair {
+            pair.validate()?;
+            ensure!(
+                pair.url == url,
+                "pairing file belongs to a different server"
+            );
+            Some(pair.ca.clone())
+        } else {
+            None
+        };
         let token = checked(
-            http()?
+            http(paired_ca.as_deref())?
                 .post(format!("{url}/v1/login"))
                 .json(&login)
                 .send()?,
@@ -390,10 +428,18 @@ impl Api {
             account: login.account,
             device: login.device,
             token,
+            paired_ca,
         })
     }
     pub fn new(c: Credentials) -> Result<Self> {
-        Ok(Self { c, client: http()? })
+        if c.paired_ca.is_some() {
+            ensure!(
+                canonical_url(&c.url)?.starts_with("https://"),
+                "a paired server requires HTTPS"
+            );
+        }
+        let client = http(c.paired_ca.as_deref())?;
+        Ok(Self { c, client })
     }
     pub fn rpc<T: DeserializeOwned>(&self, a: Action) -> Result<T> {
         let send = || -> Result<T> {
@@ -497,13 +543,33 @@ pub fn default_device() -> String {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "PC".into())
 }
-pub fn discover() -> Vec<(String, String, PathBuf)> {
-    let mut games = BTreeMap::new();
-    let installs = match std::env::var_os("BUDDY_STEAM_ROOT") {
+fn steam_installs() -> Vec<steamlocate::SteamDir> {
+    match std::env::var_os("BUDDY_STEAM_ROOT") {
         Some(p) => steamlocate::SteamDir::from_dir(Path::new(&p)).map(|s| vec![s]),
         None => steamlocate::locate_all(),
+    }
+    .unwrap_or_default()
+}
+
+pub fn has_cloud_history(game: &str) -> bool {
+    let Some(id) = game
+        .strip_prefix("steam-")
+        .and_then(|s| s.parse::<u32>().ok())
+    else {
+        return false;
     };
-    for install in installs.unwrap_or_default() {
+    let app = id.to_string();
+    steam_installs().iter().any(|steam| {
+        steam.path().join("userdata").read_dir().is_ok_and(|users| {
+            users
+                .flatten()
+                .any(|user| user.path().join(&app).join("remotecache.vdf").is_file())
+        })
+    })
+}
+pub fn discover() -> Vec<(String, String, PathBuf)> {
+    let mut games = BTreeMap::new();
+    for install in steam_installs() {
         if let Ok(libs) = install.libraries() {
             for lib in libs.flatten() {
                 for app in lib.apps().flatten() {

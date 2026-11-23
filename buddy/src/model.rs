@@ -134,6 +134,14 @@ pub enum Entry {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tree(pub BTreeMap<String, Entry>);
+pub fn portable_path(name: &str, folded: &mut BTreeSet<String>) -> Result<()> {
+    ensure!(name.len() <= 4096, "path too long");
+    ensure!(
+        folded.insert(name.nfc().collect::<String>().to_lowercase()),
+        "case or Unicode filename collision at {name}"
+    );
+    Ok(())
+}
 impl Tree {
     pub fn project(&self, scope: &Recipe) -> Tree {
         let mut entries = BTreeMap::new();
@@ -173,7 +181,7 @@ impl Tree {
     pub fn validate(&self, recipe: &Recipe) -> Result<()> {
         let mut folded = BTreeSet::new();
         for (name, entry) in &self.0 {
-            ensure!(name.len() <= 4096, "path too long");
+            portable_path(name, &mut folded)?;
             let mut parts = name.split('/');
             let slot = recipe
                 .slots
@@ -196,10 +204,6 @@ impl Tree {
                     "wrong kind for {name}"
                 );
             }
-            ensure!(
-                folded.insert(name.nfc().collect::<String>().to_lowercase()),
-                "case or Unicode filename collision at {name}"
-            );
             if let Entry::File { size, hash, chunks } = entry {
                 ensure!(hash_ok(hash), "invalid file digest");
                 let mut total = 0u64;
@@ -291,6 +295,8 @@ pub struct Credentials {
     pub account: String,
     pub device: String,
     pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_ca: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Login {

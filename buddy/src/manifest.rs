@@ -40,14 +40,59 @@ pub struct Suggestion {
     pub kind: Kind,
     pub settings: bool,
     pub source: String,
+    pub slot: Option<&'static str>,
 }
 
 // Index once on explicit local import. Only the games with IDs and file rules need disk entries.
 pub fn import(local: &Local, path: &Path) -> Result<usize> {
+    let _lock = local.lock("path-catalog")?;
+    index(local, fs::File::open(path)?)
+}
+
+const UPSTREAM: &str = "https://raw.githubusercontent.com/mtkennerly/ludusavi-manifest/refs/heads/data/data/manifest.yaml";
+pub fn download(local: &Local) -> Result<String> {
+    use reqwest::header::{ETAG, IF_NONE_MATCH};
+    let _lock = local.lock("path-catalog")?;
+    let dir = local.home.join("manifests");
+    let current = fs::read_to_string(dir.join("current")).unwrap_or_default();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(90))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let mut request = client.get(UPSTREAM);
+    if let Ok(cache) = fs::read(dir.join("upstream.json"))
+        && let Ok((revision, etag)) = serde_json::from_slice::<(String, String)>(&cache)
+        && revision == current
+        && dir.join(&revision).is_dir()
+    {
+        request = request.header(IF_NONE_MATCH, etag);
+    }
+    let response = request.send()?.error_for_status()?;
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok("Community paths are up to date.".into());
+    }
+    ensure!(
+        response.status() == reqwest::StatusCode::OK,
+        "catalog download returned {}",
+        response.status()
+    );
+    let etag = response
+        .headers()
+        .get(ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let count = index(local, response)?;
+    if let Some(tag) = etag {
+        let revision = fs::read_to_string(dir.join("current"))?;
+        let mut meta = tempfile::NamedTempFile::new_in(&dir)?;
+        serde_json::to_writer(&mut meta, &(revision, tag))?;
+        meta.persist(dir.join("upstream.json"))?;
+    }
+    Ok(format!("Downloaded path suggestions for {count} games."))
+}
+fn index(local: &Local, reader: impl Read) -> Result<usize> {
     let mut bytes = Vec::new();
-    fs::File::open(path)?
-        .take(64 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
+    reader.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= 64 * 1024 * 1024, "manifest exceeds 64 MiB");
     let catalog: BTreeMap<String, Game> =
         serde_yaml_ng::from_slice(&bytes).context("parse Ludusavi YAML manifest")?;
@@ -88,18 +133,19 @@ pub fn candidates(local: &Local, game: &str) -> Result<Vec<Suggestion>> {
     else {
         return Ok(vec![]);
     };
+    let roots = roots(game);
+    let mut found = builtin(id, &roots);
     let dir = local.home.join("manifests");
     if !dir.join("current").is_file() {
-        return Ok(vec![]);
+        return Ok(found);
     }
     let revision = fs::read_to_string(dir.join("current"))?;
     ensure!(crate::model::hash_ok(&revision), "invalid manifest index");
     let index = dir.join(&revision).join(id.to_string());
     if !index.is_file() {
-        return Ok(vec![]);
+        return Ok(found);
     }
     let rules: BTreeMap<String, FileRule> = serde_json::from_slice(&fs::read(index)?)?;
-    let roots = roots(game);
     let mut vars = BTreeMap::<&str, PathBuf>::new();
     for (a, b) in [
         ("<home>", "home"),
@@ -139,8 +185,7 @@ pub fn candidates(local: &Local, game: &str) -> Result<Vec<Suggestion>> {
             }
         }
     }
-    let mut seen = BTreeSet::new();
-    let mut found = vec![];
+    let mut seen: BTreeSet<_> = found.iter().map(|s| s.path.clone()).collect();
     for (template, rule) in rules {
         if !rule.when.is_empty()
             && !rule.when.iter().any(|w| {
@@ -194,8 +239,63 @@ pub fn candidates(local: &Local, game: &str) -> Result<Vec<Suggestion>> {
                 kind,
                 settings: rule.tags.iter().any(|s| s == "config"),
                 source: format!("Ludusavi manifest {revision}"),
+                slot: None,
             });
         }
     }
     Ok(found)
+}
+
+// These recipes describe the vanilla games' local storage observed on installed copies.
+// No community catalog is distributed with the executable.
+fn builtin(id: u32, roots: &BTreeMap<String, PathBuf>) -> Vec<Suggestion> {
+    let mut found = Vec::new();
+    let mut add = |base: &Path, rel: &str, slot, kind, settings| {
+        let path = base.join(rel);
+        if (kind == Kind::Folder && path.is_dir() || kind == Kind::File && path.is_file())
+            && let Ok(path) = path.canonicalize()
+            && !found.iter().any(|s: &Suggestion| s.path == path)
+        {
+            found.push(Suggestion {
+                path,
+                slot: Some(slot),
+                kind,
+                settings,
+                source: "Buddy built-in recipe v1".into(),
+            });
+        }
+    };
+    match id {
+        105600 => {
+            let mut bases = Vec::new();
+            if cfg!(target_os = "linux")
+                && let Some(base) = roots.get("data")
+            {
+                bases.push(base.join("Terraria"));
+            }
+            if cfg!(windows)
+                && let Some(doc) = roots.get("documents")
+            {
+                bases.push(doc.join("My Games/Terraria"));
+            }
+            if let Some(pfx) = roots.get("pfx") {
+                bases.push(pfx.join("drive_c/users/steamuser/Documents/My Games/Terraria"));
+            }
+            for base in bases {
+                add(&base, "Players", "players", Kind::Folder, false);
+                add(&base, "Worlds", "worlds", Kind::Folder, false);
+                add(&base, "config.json", "config", Kind::File, true);
+            }
+        }
+        211820 => {
+            if let Some(install) = roots.get("install") {
+                let storage = install.join("storage");
+                add(&storage, "player", "players", Kind::Folder, false);
+                add(&storage, "universe", "universe", Kind::Folder, false);
+                add(&storage, "starbound.config", "config", Kind::File, true);
+            }
+        }
+        _ => {}
+    }
+    found
 }

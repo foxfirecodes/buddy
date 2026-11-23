@@ -284,6 +284,16 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
     let c = local.credentials()?;
     let api = Api::new(c.clone())?;
     let _game_lock = local.lock(&format!("{}:{g}", local.scope(&c)))?;
+    #[cfg(target_os = "linux")]
+    let mut s = crate::proton::first_launch(
+        local,
+        &api,
+        g,
+        &options.command,
+        ui,
+        local.maybe_setup(&c, g)?,
+    )?;
+    #[cfg(not(target_os = "linux"))]
     let mut s = local.setup(&c, g)?;
     if s.draft.is_some()
         && crate::setup::idle(&s)
@@ -338,6 +348,10 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
         match acquire(&api, &s, ui) {
             Ok(grant) => break grant,
             Err(e) if !options.command.is_empty() && unreachable(&e) => {
+                ensure!(
+                    !s.needs_first_pull,
+                    "Connect to your Buddy server to finish the first Proton restore before playing."
+                );
                 let msg = format!(
                     "Cannot reach {}. Use the last approved setup and keep this session on {} until it reconnects?",
                     c.url, c.device
@@ -476,6 +490,7 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
             s.restore = None;
         }
         s.base = Some(next.clone());
+        s.needs_first_pull = false;
         local.save(&c, &s)?;
         if options.pin {
             api.rpc::<()>(Action::Pin {

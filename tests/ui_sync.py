@@ -49,6 +49,67 @@ def start(config):
     return server,line.split()[-1]
 
 
+def first_proton_play():
+    app = "steam-424242"
+    seed_compat = root/"populated source"
+    rel = Path("drive_c/users/steamuser/AppData/Roaming/Fixture Game")
+    seed = seed_compat/"pfx"/rel
+    seed.mkdir(parents=True)
+    (seed/"game.sav").write_bytes(b"pre-existing server save")
+    def steam(profile, data):
+        return dict(args(profile), SteamAppId="424242", STEAM_COMPAT_DATA_PATH=str(data),
+                    STEAM_COMPAT_TOOL_PATHS=str(root/"compatibility tool"))
+    def seed_call(*argv):
+        subprocess.run([binary, *map(str,argv)], env=steam("A",seed_compat), check=True)
+    seed_call("setup", app, seed)
+    seed_call("sync", app)
+
+    compat = root/"new prefix"
+    tool = root/"compatibility tool"/"proton"
+    tool.parent.mkdir()
+    tool.write_text("""#!/usr/bin/env python3
+import os, sys
+from pathlib import Path
+p = Path(os.environ["STEAM_COMPAT_DATA_PATH"])/"pfx"
+if sys.argv[1:] == ["getcompatpath", "/"]:
+    assert "BUDDY_INVITE" not in os.environ and "BUDDY_PASSWORD" not in os.environ
+    (p/"drive_c/users/steamuser/AppData/Roaming").mkdir(parents=True)
+    (p/"user.reg").touch()
+elif sys.argv[1:] == ["waitforexitandrun", "fixture game.exe", "a b"]:
+    assert (p/"drive_c/users/steamuser/AppData/Roaming/Fixture Game/game.sav").read_bytes() == b"pre-existing server save"
+    (p/"first-game-entry").touch()
+else:
+    raise RuntimeError("unexpected launch arguments")
+""")
+    tool.chmod(0o755)
+    runtime = root/"_v2-entry-point"
+    runtime.write_text('#!/bin/sh\ncase "$1" in --verb=getcompatpath|--verb=waitforexitandrun) shift;; *) exit 5;; esac\n[ "$1" = -- ] || exit 7\nshift\nexec "$@"\n')
+    runtime.chmod(0o755)
+    command = [binary, "run", "--game", app, "--", runtime, "--verb=waitforexitandrun", "--",
+               tool, "waitforexitandrun", "fixture game.exe", "a b"]
+    def play():
+        return subprocess.Popen(command, env=dict(steam("B",compat),BUDDY_PASSWORD="test",BUDDY_INVITE="test"))
+    proc = play()
+    window("Set up the Proton prefix", ["Return"])
+    window("Buddy needs attention", ["Return"])
+    assert proc.wait(timeout=10) != 0 and not compat.exists()
+    proc = play()
+    window("Set up the Proton prefix", ["Right","Return"])
+    window("Confirm Proton save locations", ["Return"])
+    window("Buddy needs attention", ["Return"])
+    assert proc.wait(timeout=10) != 0 and not (compat/"pfx"/rel).exists()
+    proc = play()
+    window("Confirm Proton save locations", ["Right","Return"])
+    assert proc.wait(timeout=15) == 0 and (compat/"pfx/first-game-entry").is_file()
+    call("B", "unbind", app, "saves")
+    (compat/"pfx/first-game-entry").unlink()
+    proc = play()
+    window("Buddy needs attention", ["Return"])
+    assert proc.wait(timeout=10) != 0 and not (compat/"pfx/first-game-entry").exists()
+    assert "saves:" not in call("B", "status", app)
+    print("PASS first Proton enrollment respects cancellation, restores before launch and preserves explicit unbind", flush=True)
+
+
 def run():
     config=root/"server.toml"
     config.write_text('listen="127.0.0.1:0"\ndatabase="server.sqlite"\n')
@@ -123,6 +184,7 @@ def run():
             if late.poll() is None:
                 late.kill();late.wait()
         print("PASS displaced live game keeps its exit code, queued changes and pinned backup",flush=True)
+        first_proton_play()
     finally:
         server.terminate();server.wait(timeout=8)
 

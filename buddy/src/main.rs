@@ -1,9 +1,12 @@
 mod files;
+mod host;
 mod index;
 mod local;
 mod manifest;
 mod model;
 mod pack;
+#[cfg(target_os = "linux")]
+mod proton;
 mod server;
 mod session;
 mod setup;
@@ -33,6 +36,8 @@ struct Args {
 enum Cmd {
     /// Open the graphical client.
     Gui,
+    /// Set up or run a private HTTPS Buddy server in a window.
+    Host,
     /// Open the interactive terminal client.
     Tui,
     #[command(hide = true, name = "_decision")]
@@ -57,6 +62,9 @@ enum Cmd {
     /// Register or sign this device in.
     Login {
         url: String,
+        /// Trust the host certificate in this server pairing file.
+        #[arg(long)]
+        pairing: Option<PathBuf>,
         account: String,
         #[arg(long)]
         device: Option<String>,
@@ -93,6 +101,8 @@ enum Cmd {
     Catalog,
     /// Index a local Ludusavi YAML catalog for path suggestions.
     LoadManifest { path: PathBuf },
+    /// Download or refresh path suggestions directly from the upstream Ludusavi manifest.
+    FetchManifest,
     /// Show detected file candidates for a Steam game.
     Suggestions { game: String },
     /// Bind a file or directory to a logical selection.
@@ -174,7 +184,10 @@ fn cli_decisions(interactive: bool) -> Interface {
 }
 fn main() {
     let args = Args::parse();
-    let window = matches!(&args.command, None | Some(Cmd::Gui | Cmd::Run { .. }));
+    let window = matches!(
+        &args.command,
+        None | Some(Cmd::Gui | Cmd::Host | Cmd::Run { .. })
+    );
     let code = match dispatch(args) {
         Ok(code) => code,
         Err(e) => {
@@ -210,9 +223,11 @@ fn dispatch(args: Args) -> Result<i32> {
             let l = Local::open(args.profile_dir)?;
             match cmd {
                 Cmd::Gui => ui::gui(l)?,
+                Cmd::Host => host::gui(l)?,
                 Cmd::Tui => ui::tui(&l)?,
                 Cmd::Login {
                     url,
+                    pairing,
                     account,
                     device,
                     invite,
@@ -228,8 +243,9 @@ fn dispatch(args: Args) -> Result<i32> {
                             .without_confirmation()
                             .prompt()?
                     };
+                    let pair = pairing.as_deref().map(host::Pairing::load).transpose()?;
                     l.set_login(
-                        &Api::login(
+                        &Api::login_paired(
                             &url,
                             Login {
                                 account,
@@ -237,10 +253,12 @@ fn dispatch(args: Args) -> Result<i32> {
                                 device: device.unwrap_or_else(local::default_device),
                                 invite,
                             },
+                            pair.as_ref(),
                         )?,
                         private_file_credential,
                     )?;
                 }
+                Cmd::FetchManifest => println!("{}", manifest::download(&l)?),
                 Cmd::LoadManifest { path } => {
                     println!("Indexed {} games", manifest::import(&l, &path)?)
                 }
@@ -301,6 +319,7 @@ fn dispatch(args: Args) -> Result<i32> {
                         path,
                         source: None,
                     },
+                    None,
                 )?,
                 Cmd::Policy {
                     game,

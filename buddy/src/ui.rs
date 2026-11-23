@@ -128,6 +128,9 @@ pub fn progress_window() -> Result<()> {
                 break;
             }
         }
+        // This is a dedicated progress process. EOF means the wrapper has finished
+        // or exited. A suspended or occluded compositor may never draw another frame.
+        std::process::exit(0);
     });
     let mut text = String::from("Checking game files…");
     eframe::run_simple_native("Buddy sync", native([410., 115.]), move |ctx, _| {
@@ -177,6 +180,8 @@ impl Progress {
             let Ok(mut child) = Command::new(binary)
                 .arg("_progress")
                 .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .spawn()
             else {
                 return;

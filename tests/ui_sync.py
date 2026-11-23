@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import socket
 from pathlib import Path
 import subprocess
 import sys
@@ -47,6 +48,30 @@ def start(config):
     line=server.stderr.readline().strip()
     assert line.startswith("Buddy listening on "),line
     return server,line.split()[-1]
+
+
+def progress_with_stalled_display():
+    # Accept the X11 connection but never finish its handshake. No frames can render.
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(5)
+        port = listener.getsockname()[1]
+        stalled = dict(env, DISPLAY=f"127.0.0.1:{port-6000}", XDG_SESSION_TYPE="x11")
+        stalled.pop("WAYLAND_DISPLAY", None)
+        stalled.pop("WAYLAND_SOCKET", None)
+        proc = subprocess.Popen([binary, "_progress"], stdin=subprocess.PIPE, env=stalled)
+        try:
+            conn, _ = listener.accept()
+            with conn:
+                assert proc.poll() is None
+                proc.stdin.close()
+                assert proc.wait(timeout=3) == 0
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    print("PASS progress exits on wrapper EOF with an unresponsive display", flush=True)
 
 
 def first_proton_play():
@@ -111,6 +136,7 @@ else:
 
 
 def run():
+    progress_with_stalled_display()
     config=root/"server.toml"
     config.write_text('listen="127.0.0.1:0"\ndatabase="server.sqlite"\n')
     server,addr=start(config);url="http://"+addr

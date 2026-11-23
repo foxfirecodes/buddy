@@ -8,6 +8,15 @@ pub struct Volume {
     #[cfg(target_os = "linux")]
     device: Option<u64>,
 }
+pub struct Stamp {
+    value: String,
+    changed: i64,
+    observed: i64,
+}
+pub struct Hint {
+    pub entry: Entry,
+    pub trusted: bool,
+}
 impl Volume {
     pub fn new(dir: &Dir) -> Self {
         #[cfg(target_os = "linux")]
@@ -28,28 +37,31 @@ impl Volume {
             Self {}
         }
     }
-    pub fn stamp(&self, m: &Metadata) -> Option<String> {
+    pub fn stamp(&self, m: &Metadata) -> Option<Stamp> {
         #[cfg(target_os = "linux")]
         {
             use cap_std::fs::MetadataExt;
             if Some(m.dev()) != self.device || m.len() < 1024 * 1024 {
                 return None;
             }
-            // A coarse timestamp, clock rollback or recent write is re-read. A caller cannot
-            // restore ctime with utimensat when replacing bytes and preserving mtime.
-            if m.ctime_nsec() == 0 || m.ctime() >= crate::model::now() - 2 {
+            let observed = crate::model::now();
+            if m.ctime_nsec() == 0 || m.ctime() > observed {
                 return None;
             }
-            Some(format!(
-                "{}:{}:{}:{}:{}:{}:{}",
-                m.dev(),
-                m.ino(),
-                m.len(),
-                m.ctime(),
-                m.ctime_nsec(),
-                m.mtime(),
-                m.mtime_nsec()
-            ))
+            Some(Stamp {
+                value: format!(
+                    "{}:{}:{}:{}:{}:{}:{}",
+                    m.dev(),
+                    m.ino(),
+                    m.len(),
+                    m.ctime(),
+                    m.ctime_nsec(),
+                    m.mtime(),
+                    m.mtime_nsec()
+                ),
+                changed: m.ctime(),
+                observed,
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -70,25 +82,27 @@ impl Index {
         let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
         Ok(Self { db, boot })
     }
-    pub fn lookup(&self, path: &Path, stamp: &str, cache: &Cache) -> Result<Option<Entry>> {
+    pub fn lookup(&self, path: &Path, stamp: &Stamp, cache: &Cache) -> Result<Option<Hint>> {
         use rusqlite::OptionalExtension;
         if self.boot.is_empty() {
             return Ok(None);
         }
-        let entry: Option<String> = self
+        let row: Option<(String, i64)> = self
             .db
             .query_row(
-                "SELECT entry FROM files WHERE path=? AND boot=? AND stamp=? AND observed <= ?",
+                "SELECT entry,observed FROM files WHERE path=? AND boot=? AND stamp=? AND observed <= ?",
                 rusqlite::params![
                     path.to_string_lossy(),
                     self.boot,
-                    stamp,
-                    crate::model::now()
+                    stamp.value,
+                    stamp.observed
                 ],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some(entry) = entry else { return Ok(None) };
+        let Some((entry, observed)) = row else {
+            return Ok(None);
+        };
         let entry: Entry = serde_json::from_str(&entry)?;
         if let Entry::File { chunks, .. } = &entry {
             let mut seen = std::collections::BTreeSet::new();
@@ -104,19 +118,62 @@ impl Index {
                 }
             }
         }
-        Ok(Some(entry))
+        // Bytes read too close to ctime can have changed in the same filesystem
+        // clock tick, even if the file has since aged. Confirm the digest once
+        // after the stamp matures before accepting metadata alone.
+        Ok(Some(Hint {
+            entry,
+            trusted: stamp.changed < observed.saturating_sub(2),
+        }))
     }
-    pub fn remember(&self, path: &Path, stamp: &str, entry: &Entry) -> Result<()> {
+    pub fn remember(&self, path: &Path, stamp: &Stamp, entry: &Entry) -> Result<()> {
         self.db.execute(
             "INSERT OR REPLACE INTO files VALUES(?,?,?,?,?)",
             rusqlite::params![
                 path.to_string_lossy(),
                 self.boot,
-                stamp,
-                crate::model::now(),
+                stamp.value,
+                stamp.observed,
                 serde_json::to_string(entry)?
             ],
         )?;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::model::{Chunk, digest};
+    #[test]
+    fn a_recent_observation_needs_digest_confirmation_even_after_aging() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let cache = Cache::open(tmp.path().to_owned())?;
+        let index = Index::open(&tmp.path().join("scan.sqlite"))?;
+        let path = tmp.path().join("world");
+        let mut stamp = Stamp {
+            value: "identity".into(),
+            changed: 100,
+            observed: 100,
+        };
+        let hash = digest(b"x");
+        cache.put(&hash, b"x")?;
+        let entry = Entry::File {
+            size: 1,
+            hash: hash.clone(),
+            chunks: vec![Chunk {
+                size: 1,
+                hash: hash.clone(),
+            }],
+        };
+        index.remember(&path, &stamp, &entry)?;
+        assert!(!index.lookup(&path, &stamp, &cache)?.unwrap().trusted);
+        stamp.observed += 10;
+        assert!(!index.lookup(&path, &stamp, &cache)?.unwrap().trusted);
+        index.remember(&path, &stamp, &entry)?;
+        assert!(index.lookup(&path, &stamp, &cache)?.unwrap().trusted);
+        std::fs::remove_file(tmp.path().join(hash))?;
+        assert!(index.lookup(&path, &stamp, &cache)?.is_none());
         Ok(())
     }
 }

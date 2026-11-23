@@ -222,8 +222,14 @@ impl Tree {
         Ok(())
     }
     pub fn chunks(&self) -> Result<BTreeMap<String, u32>> {
+        self.chunks_since(None)
+    }
+    pub fn chunks_since(&self, before: Option<&Tree>) -> Result<BTreeMap<String, u32>> {
         let mut result = BTreeMap::new();
-        for entry in self.0.values() {
+        for (name, entry) in &self.0 {
+            if before.and_then(|t| t.0.get(name)) == Some(entry) {
+                continue;
+            }
             if let Entry::File { chunks, .. } = entry {
                 for c in chunks {
                     if result

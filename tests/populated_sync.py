@@ -132,6 +132,28 @@ def setup(profile, world, cfg, endpoint, new=False):
     cli(profile, 'setup', 'world', world)
 
 
+def measure_client(command, env):
+    """Count bytes read by the Linux client, including reads served from page cache."""
+    counts = {}
+    with tempfile.TemporaryFile(mode='w+t') as log:
+        started = time.monotonic()
+        with subprocess.Popen(command, env=env, stdout=log, stderr=log) as proc:
+            if sys.platform == 'linux':
+                # The kernel retains final I/O counters until wait() reaps the child.
+                os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+                try:
+                    lines = Path(f'/proc/{proc.pid}/io').read_text().splitlines()
+                except OSError:
+                    pass  # procfs counters can be restricted by the host.
+                else:
+                    io = dict(line.split(': ') for line in lines)
+                    counts = {f'client_{key}': int(io[key]) for key in ('rchar', 'read_bytes') if key in io}
+            code = proc.wait()
+            seconds = round(time.monotonic() - started, 3)
+        log.seek(0)
+        return code, log.read(), seconds, counts
+
+
 def trial(root, args, report):
     a, b = root/'a', root/'b'
     src, dst = root/'source', root/'destination'
@@ -184,13 +206,11 @@ def trial(root, args, report):
                 # This benchmark may start a progress helper. Leave the primary desktop alone.
                 for key in ('DISPLAY', 'WAYLAND_DISPLAY', 'WAYLAND_SOCKET'):
                     environment.pop(key, None)
-            proc = subprocess.run([binary, '--profile-dir', profile, *args], env=environment,
-                                  capture_output=True, text=True)
-            metrics = dict(seconds=round(time.monotonic()-started, 3),
-                           uploaded=link.upload, downloaded=link.download)
-            assert (proc.returncode == 0) == succeeds, proc.stderr[-1000:]
+            code, output, seconds, counts = measure_client([binary, '--profile-dir', profile, *args], environment)
+            metrics = dict(seconds=seconds, uploaded=link.upload, downloaded=link.download, **counts)
+            assert (code == 0) == succeeds, output[-1000:]
             if not succeeds:
-                assert '503' in proc.stderr, proc.stderr
+                assert '503' in output, output
             if launch:
                 metrics['until_game_entry_seconds'] = round(float(stamp.read_text()) - started, 3)
             print(label, metrics, flush=True)

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{ErrorKind, Read, Write},
+    io::{ErrorKind, Read, Seek, Write},
     path::{Path, PathBuf},
 };
 
@@ -142,7 +142,105 @@ struct Root {
     kind: Kind,
     anchor: PathBuf,
 }
+fn check_link(meta: &cap_std::fs::Metadata, logical: &str) -> Result<()> {
+    ensure!(
+        !meta.file_type().is_symlink(),
+        "symlink in selection: {logical}"
+    );
+    #[cfg(windows)]
+    {
+        use cap_std::fs::MetadataExt;
+        ensure!(
+            meta.file_attributes() & 0x400 == 0,
+            "reparse point in selection: {logical}"
+        );
+    }
+    Ok(())
+}
+
 impl Root {
+    fn open_file(
+        &self,
+        logical: &str,
+        path: &Path,
+        meta: &cap_std::fs::Metadata,
+    ) -> Result<cap_std::fs::File> {
+        check_link(meta, logical)?;
+        ensure!(meta.is_file(), "special file in selection: {logical}");
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(target_os = "linux")]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            use rustix::fs::OFlags;
+            options.custom_flags((OFlags::NONBLOCK | OFlags::NOFOLLOW).bits() as i32);
+        }
+        let file = self.dir.open_with(path, &options)?;
+        ensure!(
+            same_file_state(meta, &file.metadata()?)?,
+            "file replaced during capture: {logical}"
+        );
+        Ok(file)
+    }
+
+    fn read_file(
+        &self,
+        logical: &str,
+        path: &Path,
+        meta: &cap_std::fs::Metadata,
+        cache: &Cache,
+        allow_hints: bool,
+        expected: Option<&Entry>,
+    ) -> Result<Entry> {
+        if let Some(entry) = expected {
+            ensure!(
+                matches!(entry, Entry::File { size, .. } if *size == meta.len()),
+                "unexpected local edit during restore at {logical}"
+            );
+        }
+        let stamp = self.volume.stamp(meta);
+        let absolute = self.anchor.join(path);
+        let hint = match &stamp {
+            Some(stamp) if allow_hints => cache.1.lookup(&absolute, stamp, cache)?,
+            _ => None,
+        };
+        if let Some(hint) = &hint
+            && hint.trusted
+            && expected.is_none_or(|known| known == &hint.entry)
+        {
+            return Ok(hint.entry.clone());
+        }
+        let mut file = self.open_file(logical, path, meta)?;
+        // Verification only needs the manifest's whole-file digest. The same
+        // check can confirm a recently installed file whose ctime was too
+        // fresh to trust when its bytes were last observed.
+        let candidate = expected.or_else(|| hint.as_ref().map(|h| &h.entry));
+        let entry = if let Some(entry @ Entry::File { hash, .. }) = candidate {
+            let mut digest = blake3::Hasher::new();
+            digest.update_reader(&mut file)?;
+            if digest.finalize().to_hex().as_str() == hash {
+                entry.clone()
+            } else {
+                ensure!(
+                    expected.is_none(),
+                    "unexpected local edit during restore at {logical}"
+                );
+                file.rewind()?;
+                capture_file(file, cache, meta.len())?
+            }
+        } else {
+            capture_file(file, cache, meta.len())?
+        };
+        ensure!(
+            same_file_state(meta, &self.dir.symlink_metadata(path)?)?,
+            "file changed during capture: {logical}"
+        );
+        if let Some(stamp) = &stamp {
+            cache.1.remember(&absolute, stamp, &entry)?;
+        }
+        Ok(entry)
+    }
+
     fn walk(
         &self,
         slot: &str,
@@ -162,18 +260,7 @@ impl Root {
                 }
                 Err(e) => return Err(e.into()),
             };
-            ensure!(
-                !meta.file_type().is_symlink(),
-                "symlink in selection: {logical}"
-            );
-            #[cfg(windows)]
-            {
-                use cap_std::fs::MetadataExt;
-                ensure!(
-                    meta.file_attributes() & 0x400 == 0,
-                    "reparse point in selection: {logical}"
-                );
-            }
+            check_link(&meta, &logical)?;
             if meta.is_dir() {
                 let names = dir_names(&self.dir, &path)?;
                 for name in &names {
@@ -371,6 +458,16 @@ impl Files {
         stage: Option<&str>,
         allow_hints: bool,
     ) -> Result<Tree> {
+        self.read_tree(recipe, cache, stage, allow_hints, None)
+    }
+    fn read_tree(
+        &self,
+        recipe: &Recipe,
+        cache: &Cache,
+        stage: Option<&str>,
+        allow_hints: bool,
+        expected: Option<&Tree>,
+    ) -> Result<Tree> {
         let mut tree = Tree::default();
         let mut stamps = BTreeMap::new();
         for (slot, root) in &self.roots {
@@ -378,35 +475,14 @@ impl Files {
                 let entry = if meta.is_dir() {
                     Entry::Directory
                 } else {
-                    let stamp = root.volume.stamp(&meta);
-                    let absolute = root.anchor.join(&path);
-                    let old = if allow_hints {
-                        match &stamp {
-                            Some(s) => cache.1.lookup(&absolute, s, cache)?,
-                            None => None,
-                        }
-                    } else {
-                        None
+                    let expected_file = match expected {
+                        Some(tree) => Some(tree.0.get(&logical).with_context(|| {
+                            format!("unexpected local edit during restore at {logical}")
+                        })?),
+                        None => None,
                     };
-                    let entry = match old {
-                        Some(entry) => entry,
-                        None => {
-                            let file = root.dir.open(&path)?;
-                            ensure!(
-                                same_file_state(&meta, &file.metadata()?)?,
-                                "file replaced during capture: {logical}"
-                            );
-                            let entry = capture_file(file, cache, meta.len())?;
-                            ensure!(
-                                same_file_state(&meta, &root.dir.symlink_metadata(&path)?)?,
-                                "file changed during capture: {logical}"
-                            );
-                            if let Some(stamp) = &stamp {
-                                cache.1.remember(&absolute, stamp, &entry)?;
-                            }
-                            entry
-                        }
-                    };
+                    let entry =
+                        root.read_file(&logical, &path, &meta, cache, allow_hints, expected_file)?;
                     stamps.insert(logical.clone(), meta);
                     entry
                 };
@@ -415,6 +491,12 @@ impl Files {
             })?;
         }
         tree.validate(recipe)?;
+        if let Some(expected) = expected {
+            ensure!(
+                &tree == expected,
+                "unexpected local edit during restore: file inventory changed"
+            );
+        }
         // Detect additions, removals and edits that occurred elsewhere in the tree during the read.
         for (path, entry) in &tree.0 {
             let (root, rel) = self.where_is(path)?;
@@ -445,10 +527,27 @@ impl Files {
                 );
             }
         }
+        // File slots may be absent from the entire inventory. Catch a newly appeared
+        // slot as well as additions beneath the directories checked above.
+        for (slot, root) in &self.roots {
+            if root.kind == Kind::File && !tree.0.contains_key(slot) {
+                match root.dir.symlink_metadata(&root.base) {
+                    Err(e) if e.kind() == ErrorKind::NotFound => (),
+                    Err(e) => return Err(e.into()),
+                    Ok(_) => bail!("file appeared during capture: {slot}"),
+                }
+            }
+        }
         Ok(tree)
     }
 
+    pub fn apply_new(&self, recipe: &Recipe, cache: &Cache, plan: &Restore) -> Result<()> {
+        self.restore(recipe, cache, plan, false)
+    }
     pub fn apply(&self, recipe: &Recipe, cache: &Cache, plan: &Restore) -> Result<()> {
+        self.restore(recipe, cache, plan, true)
+    }
+    fn restore(&self, recipe: &Recipe, cache: &Cache, plan: &Restore, replay: bool) -> Result<()> {
         plan.before.validate(recipe)?;
         plan.after.validate(recipe)?;
         let stage = format!(".buddy-stage-{}", plan.op);
@@ -459,21 +558,76 @@ impl Files {
                 "staging name collision"
             );
         }
-        let current = self.capture(recipe, cache, Some(&stage))?;
-        for (k, v) in &current.0 {
-            ensure!(
-                Some(v) == plan.before.0.get(k) || Some(v) == plan.after.0.get(k),
-                "unexpected local edit during restore at {k}; originals are cached"
-            );
+        let current = if replay {
+            self.recover_inventory(recipe, cache, plan, &stage)?
+        } else {
+            self.read_tree(recipe, cache, None, true, Some(&plan.before))?
+        };
+        self.stage_files(cache, &stage, &current, &plan.after)?;
+        self.install_staged(recipe, cache, plan, &stage, &current, replay)
+    }
+
+    fn recover_inventory(
+        &self,
+        recipe: &Recipe,
+        cache: &Cache,
+        plan: &Restore,
+        stage: &str,
+    ) -> Result<Tree> {
+        // Read surviving bytes to repair cached chunks before resuming or rolling back.
+        let mut current = self.scan(recipe, cache, Some(stage), false)?;
+        for (name, entry) in &mut current.0 {
+            let candidates = [plan.after.0.get(name), plan.before.0.get(name)];
+            // Prefer the target when both versions contain the same bytes. Its
+            // chunk boundaries can differ even if the source layout exactly matches.
+            let matching = candidates
+                .into_iter()
+                .flatten()
+                .find(|candidate| match (&*entry, candidate) {
+                    (Entry::Directory, Entry::Directory) => true,
+                    (
+                        Entry::File { size, hash, .. },
+                        Entry::File {
+                            size: s, hash: h, ..
+                        },
+                    ) => size == s && hash == h,
+                    _ => false,
+                })
+                .with_context(|| {
+                    format!("unexpected local edit during restore at {name}; originals are cached")
+                })?;
+            if matching != entry {
+                self.repair_chunks(name, matching, cache)?;
+                *entry = matching.clone();
+            }
         }
+        for (name, old) in &plan.before.0 {
+            // Same-kind replacements are atomic. Neither one nor an untouched
+            // file may legitimately disappear halfway through this journal.
+            if plan
+                .after
+                .0
+                .get(name)
+                .is_some_and(|new| std::mem::discriminant(old) == std::mem::discriminant(new))
+            {
+                ensure!(
+                    current.0.contains_key(name),
+                    "unexpected deletion during restore at {name}"
+                );
+            }
+        }
+        Ok(current)
+    }
+
+    fn stage_files(&self, cache: &Cache, stage: &str, current: &Tree, after: &Tree) -> Result<()> {
         let mut stages = BTreeSet::new();
-        for (k, target) in &plan.after.0 {
+        for (k, target) in &after.0 {
             if current.0.get(k) == Some(target) {
                 continue;
             }
             if let Entry::File { hash, size, chunks } = target {
                 let (root, _) = self.where_is(k)?;
-                let stage_path = Path::new(&stage);
+                let stage_path = Path::new(stage);
                 if stages.insert(root.anchor.clone()) {
                     match root.dir.create_dir(stage_path) {
                         Ok(()) => (),
@@ -507,11 +661,20 @@ impl Files {
                 file.sync_all()?;
             }
         }
-        let verified = self.capture(recipe, cache, Some(&stage))?;
-        ensure!(
-            verified == current,
-            "local files changed during restore preparation"
-        );
+        Ok(())
+    }
+
+    fn install_staged(
+        &self,
+        recipe: &Recipe,
+        cache: &Cache,
+        plan: &Restore,
+        stage: &str,
+        current: &Tree,
+        replay: bool,
+    ) -> Result<()> {
+        self.read_tree(recipe, cache, Some(stage), !replay, Some(current))
+            .context("local files changed during restore preparation")?;
         for (k, entry) in current.0.iter().rev() {
             let target = plan.after.0.get(k);
             if target.is_none()
@@ -540,18 +703,17 @@ impl Files {
                         root.dir.create_dir(&rel)?;
                     }
                 }
-                Entry::File { .. } => root.dir.rename(
-                    Path::new(&stage).join(digest(k.as_bytes())),
-                    &root.dir,
-                    &rel,
-                )?,
+                Entry::File { .. } => {
+                    root.dir
+                        .rename(Path::new(stage).join(digest(k.as_bytes())), &root.dir, &rel)?
+                }
             }
             sync_dir(&root.anchor.join(rel.parent().unwrap_or(Path::new("."))))?;
         }
         for root in self.roots.values() {
             // Only journal-owned stage files are removed. Unexpected contents stop recovery.
-            if root.dir.symlink_metadata(&stage).is_ok() {
-                let names = dir_names(&root.dir, Path::new(&stage))?;
+            if root.dir.symlink_metadata(stage).is_ok() {
+                let names = dir_names(&root.dir, Path::new(stage))?;
                 if !names.is_empty() {
                     let owned: BTreeSet<_> = plan
                         .after
@@ -565,17 +727,80 @@ impl Files {
                             owned.contains(&name),
                             "unexpected file in restore staging directory"
                         );
-                        root.dir.remove_file(Path::new(&stage).join(name))?;
+                        root.dir.remove_file(Path::new(stage).join(name))?;
                     }
                 }
-                root.dir.remove_dir(&stage)?;
+                root.dir.remove_dir(stage)?;
                 sync_dir(&root.anchor)?;
             }
         }
+        self.read_tree(recipe, cache, None, !replay, Some(&plan.after))
+            .context("restore verification failed")?;
+        Ok(())
+    }
+}
+impl Files {
+    fn repair_chunks(&self, name: &str, original: &Entry, cache: &Cache) -> Result<()> {
+        let Entry::File { size, hash, chunks } = original else {
+            bail!("cannot repair chunks of a directory")
+        };
+        let (root, path) = self.where_is(name)?;
+        let meta = root.dir.symlink_metadata(&path)?;
+        let mut file = root.open_file(name, &path, &meta)?;
+        ensure!(meta.len() == *size, "local file size changed: {name}");
+        let mut full = blake3::Hasher::new();
+        let mut buffer = Vec::new();
+        for chunk in chunks {
+            ensure!(chunk.size as usize <= MAX_CHUNK, "invalid chunk size");
+            buffer.resize(chunk.size as usize, 0);
+            file.read_exact(&mut buffer)?;
+            // Use the original boundaries, which may differ from this client's chunker.
+            cache.put(&chunk.hash, &buffer)?;
+            full.update(&buffer);
+        }
         ensure!(
-            self.scan(recipe, cache, None, false)? == plan.after,
-            "restore verification failed"
+            full.finalize().to_hex().as_str() == hash
+                && same_file_state(&meta, &root.dir.symlink_metadata(&path)?)?,
+            "local file changed while preserving rollback data: {name}"
         );
+        Ok(())
+    }
+
+    // The restore journal must support an offline rollback. A scan hint only confirms
+    // chunk sizes, so check the originals we are about to overwrite or delete.
+    pub fn prepare_rollback(
+        &self,
+        before: &Tree,
+        after: &Tree,
+        cache: &Cache,
+        target_chunks: &mut BTreeMap<String, u32>,
+    ) -> Result<()> {
+        let mut verified = BTreeSet::new();
+        for (name, original) in &before.0 {
+            let Entry::File { chunks, .. } = original else {
+                continue;
+            };
+            if after.0.get(name) == Some(original) {
+                continue;
+            }
+            for chunk in chunks {
+                if verified.insert(&chunk.hash)
+                    && !cache
+                        .get(&chunk.hash)
+                        .is_ok_and(|d| d.len() == chunk.size as usize)
+                {
+                    self.repair_chunks(name, original, cache)
+                        .with_context(|| format!("preserving rollback data for {name}"))?;
+                    verified.extend(chunks.iter().map(|c| &c.hash));
+                    break;
+                }
+            }
+            for chunk in chunks {
+                if let Some(target_size) = target_chunks.remove(&chunk.hash) {
+                    ensure!(target_size == chunk.size, "inconsistent chunk lengths");
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -633,6 +858,59 @@ pub struct Restore {
 }
 
 #[cfg(test)]
+mod rollback_tests {
+    use super::*;
+
+    #[test]
+    fn verifies_only_changed_files_and_repairs_their_originals() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let save = tmp.path().join("save");
+        let cache_dir = tmp.path().join("cache");
+        fs::create_dir(&save)?;
+        fs::create_dir(&cache_dir)?;
+        let cache = Cache::open(cache_dir)?;
+        let recipe: Recipe = serde_json::from_value(serde_json::json!({
+            "game":"test", "title":"Test", "retention":3, "slots":{"save":{"kind":"Folder"}}
+        }))?;
+        let binding = Binding::new(&save, &Kind::Folder)?;
+        let files = Files::open(
+            &recipe,
+            &BTreeMap::from([("save".into(), binding)]),
+            &cache.0,
+        )?;
+        fs::write(save.join("remove"), b"original")?;
+        fs::write(save.join("keep"), b"unchanged")?;
+        let before = files.capture(&recipe, &cache, None)?;
+        let mut after = before.clone();
+        let moved = after.0.remove("save/remove").unwrap();
+        after.0.insert("save/elsewhere".into(), moved);
+        let original = digest(b"original");
+        let unchanged = digest(b"unchanged");
+        fs::write(cache.0.join(&original), b"damaged!")?;
+        fs::write(cache.0.join(&unchanged), b"unrelated")?;
+        let mut target = after.chunks_since(Some(&before))?;
+        assert_eq!(target, BTreeMap::from([(original.clone(), 8)]));
+        files.prepare_rollback(&before, &after, &cache, &mut target)?;
+        assert!(target.is_empty());
+        assert_eq!(cache.get(&original)?, b"original");
+        assert!(cache.get(&unchanged).is_err());
+
+        let mut backup = after.chunks()?;
+        files.prepare_rollback(&before, &after, &cache, &mut backup)?;
+        assert_eq!(backup, BTreeMap::from([(unchanged, 9)]));
+        fs::write(cache.0.join(&original), b"damaged!")?;
+        fs::write(save.join("remove"), b"external")?;
+        assert!(
+            files
+                .prepare_rollback(&before, &after, &cache, &mut backup)
+                .is_err()
+        );
+        assert_eq!(fs::read(save.join("remove"))?, b"external");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod preview_tests {
     use super::*;
     #[test]
@@ -677,6 +955,174 @@ mod preview_tests {
             }
         }
         assert!(preview(&home, &dir, Kind::Folder, "saves", || true).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+
+    struct Setup {
+        _tmp: tempfile::TempDir,
+        saves: PathBuf,
+        cache: Cache,
+        recipe: Recipe,
+        files: Files,
+        plan: Restore,
+    }
+    fn setup() -> Result<Setup> {
+        let tmp = tempfile::tempdir()?;
+        let saves = tmp.path().join("saves");
+        let profile = tmp.path().join("profile");
+        fs::create_dir(&saves)?;
+        fs::create_dir(&profile)?;
+        fs::write(saves.join("unchanged"), vec![1u8; 1024 * 1024])?;
+        fs::write(saves.join("world"), b"local")?;
+        let recipe: Recipe = serde_json::from_value(serde_json::json!({
+            "game":"test", "title":"Game", "retention":3, "slots":{"saves":{"kind":"Folder"}}
+        }))?;
+        let bindings = BTreeMap::from([("saves".into(), Binding::new(&saves, &Kind::Folder)?)]);
+        let files = Files::open(&recipe, &bindings, &profile)?;
+        let cache = Cache::open(profile)?;
+        let before = files.capture(&recipe, &cache, None)?;
+        let mut after = before.clone();
+        let bytes = b"remote";
+        let hash = digest(bytes);
+        cache.put(&hash, bytes)?;
+        after.0.insert(
+            "saves/world".into(),
+            Entry::File {
+                size: bytes.len() as u64,
+                hash: hash.clone(),
+                chunks: vec![Chunk {
+                    hash,
+                    size: bytes.len() as u32,
+                }],
+            },
+        );
+        Ok(Setup {
+            _tmp: tmp,
+            saves,
+            cache,
+            recipe,
+            files,
+            plan: Restore {
+                op: "try".into(),
+                rollback: false,
+                before,
+                after,
+            },
+        })
+    }
+
+    #[test]
+    fn same_size_edit_with_preserved_mtime_while_staging_stops_install() -> Result<()> {
+        let s = setup()?;
+        let current = s
+            .files
+            .read_tree(&s.recipe, &s.cache, None, true, Some(&s.plan.before))?;
+        let stage = ".buddy-stage-try";
+        s.files
+            .stage_files(&s.cache, stage, &current, &s.plan.after)?;
+        let path = s.saves.join("unchanged");
+        let mtime = fs::metadata(&path)?.modified()?;
+        let mut file = fs::OpenOptions::new().write(true).open(&path)?;
+        file.write_all(b"x")?;
+        file.set_modified(mtime)?;
+        drop(file);
+        let err = s
+            .files
+            .install_staged(&s.recipe, &s.cache, &s.plan, stage, &current, false)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unexpected local edit during restore at saves/unchanged")
+        );
+        assert_eq!(fs::read(s.saves.join("world"))?, b"local");
+        assert_eq!(fs::read(path)?[0], b'x');
+        Ok(())
+    }
+
+    #[test]
+    fn missing_untouched_file_stops_fresh_restore_and_journal_replay() -> Result<()> {
+        let s = setup()?;
+        fs::remove_file(s.saves.join("unchanged"))?;
+        assert!(s.files.apply_new(&s.recipe, &s.cache, &s.plan).is_err());
+        assert!(s.files.apply(&s.recipe, &s.cache, &s.plan).is_err());
+        assert_eq!(fs::read(s.saves.join("world"))?, b"local");
+        assert!(!s.saves.join("unchanged").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_destination_chunk_never_replaces_the_original() -> Result<()> {
+        let s = setup()?;
+        fs::write(s.cache.0.join(digest(b"remote")), b"broken")?;
+        let err = s.files.apply_new(&s.recipe, &s.cache, &s.plan).unwrap_err();
+        assert!(format!("{err:#}").contains("corrupt cached chunk"));
+        assert_eq!(fs::read(s.saves.join("world"))?, b"local");
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_chunk_boundaries_survive_replay_and_offline_rollback() -> Result<()> {
+        let mut s = setup()?;
+        let parts: [&[u8]; 2] = [b"re", b"mote"];
+        let Entry::File { chunks, .. } = s.plan.after.0.get_mut("saves/world").unwrap() else {
+            unreachable!()
+        };
+        chunks.clear();
+        for part in parts {
+            let hash = digest(part);
+            s.cache.put(&hash, part)?;
+            chunks.push(Chunk {
+                hash,
+                size: part.len() as u32,
+            });
+        }
+        s.files.apply_new(&s.recipe, &s.cache, &s.plan)?;
+        let first = digest(parts[0]);
+        fs::remove_file(s.cache.0.join(&first))?;
+        let canonical = s.files.scan(&s.recipe, &s.cache, None, false)?;
+        assert_ne!(canonical, s.plan.after);
+        let original = std::mem::replace(&mut s.plan.before, canonical);
+        s.files.apply(&s.recipe, &s.cache, &s.plan)?;
+        assert_eq!(s.cache.get(&first)?, parts[0]);
+        s.plan.before = original;
+        fs::write(s.cache.0.join(&first), b"xx")?;
+        std::mem::swap(&mut s.plan.before, &mut s.plan.after);
+        s.plan.rollback = true;
+        let mut chunks = s.plan.after.chunks_since(Some(&s.plan.before))?;
+        s.files
+            .prepare_rollback(&s.plan.before, &s.plan.after, &s.cache, &mut chunks)?;
+        assert_eq!(s.cache.get(&first)?, parts[0]);
+        s.files.apply(&s.recipe, &s.cache, &s.plan)?;
+        assert_eq!(fs::read(s.saves.join("world"))?, b"local");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollback_repair_rejects_a_special_file_before_reading() -> Result<()> {
+        let s = setup()?;
+        fs::remove_file(s.cache.0.join(digest(b"local")))?;
+        let path = s.saves.join("world");
+        fs::remove_file(&path)?;
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )?;
+        let error = s
+            .files
+            .prepare_rollback(
+                &s.plan.before,
+                &s.plan.after,
+                &s.cache,
+                &mut BTreeMap::new(),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("special file in selection"));
         Ok(())
     }
 }

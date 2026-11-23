@@ -497,14 +497,13 @@ impl Api {
     pub fn download(
         &self,
         cache: &Cache,
-        tree: &Tree,
+        chunks: BTreeMap<String, u32>,
         mut progress: impl FnMut(u64, u64),
     ) -> Result<()> {
         use std::io::Read;
-        let needed: Vec<_> = tree
-            .chunks()?
+        let needed: Vec<_> = chunks
             .into_iter()
-            .filter(|(h, _)| cache.get(h).is_err())
+            .filter(|(h, size)| !cache.get(h).is_ok_and(|data| data.len() == *size as usize))
             .collect();
         let total = needed.iter().map(|(_, s)| *s as u64).sum();
         let mut done = 0;

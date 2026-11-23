@@ -453,28 +453,32 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
             local.save(&c, &s)?;
         }
         let mut next = online.merge(&live, live_base.as_ref(), now())?;
+        let restoring_backup = restore_target.is_some();
         if let Some(version) = restore_target {
-            let selected = version.tree.project(&scope);
-            selected.validate(&scope)?;
-            api.download(&cache, &selected, |d, t| {
-                if let Some(p) = &progress {
-                    p.transfer("Downloading", d, t)
-                }
-            })?;
-            online.commit(&selected, false)?;
-            next = selected;
+            next = version.tree.project(&scope);
         }
-        if next != live {
+        if restoring_backup || next != live {
             progress = Some(crate::ui::Progress::start(
                 ui,
-                "Downloading and verifying changed files…",
+                if restoring_backup {
+                    "Downloading and verifying the selected backup…"
+                } else {
+                    "Downloading and verifying changed files…"
+                },
             ));
-            next.validate(&s.recipe)?;
-            api.download(&cache, &next, |d, t| {
+            next.validate(&scope)?;
+            let mut chunks = next.chunks_since((!restoring_backup).then_some(&live))?;
+            files.prepare_rollback(&live, &next, &cache, &mut chunks)?;
+            api.download(&cache, chunks, |d, t| {
                 if let Some(p) = &progress {
                     p.transfer("Downloading", d, t)
                 }
             })?;
+            if restoring_backup {
+                online.commit(&next, false)?;
+            }
+        }
+        if next != live {
             let plan = Restore {
                 rollback: false,
                 op: id(),
@@ -486,7 +490,7 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
             })?;
             s.restore = Some(plan.clone());
             local.save(&c, &s)?;
-            files.apply(&s.recipe, &cache, &plan)?;
+            files.apply_new(&s.recipe, &cache, &plan)?;
             s.restore = None;
         }
         s.base = Some(next.clone());

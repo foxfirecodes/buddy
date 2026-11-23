@@ -5,6 +5,7 @@ Buddy syncs selected game saves and settings between devices. The native Rust ap
 - [Set up Buddy on your home network](docs/onboarding.md) to host an HTTPS server, pair a second device, and preview the files you want to sync.
 - [Run the sync client and server](docs/sync.md) for setup, a two-device walkthrough, backups, and recovery.
 - [Test from Windows Steam](docs/windows-steam.md) using the disposable Windows kit and optional Dockur guest.
+- [Restore both sides of an offline Terraria conflict](docs/offline-terraria.md), [restore before a first Proton launch](docs/proton-first-play.md), or [reproduce the large-world and disk-full trials](docs/storage-trial.md).
 - [Read the product and protocol spec](SPEC.md) for design decisions and planned features.
 - [Run the Steam Deck launch probe](#buddy-launch-probe) to measure when Game Mode lets post-game work finish. This is a separate executable and experiment.
 

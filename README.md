@@ -1,0 +1,100 @@
+# Buddy
+
+Buddy syncs selected game saves and settings between devices. The native Rust app includes the graphical client, command-line and terminal clients, Steam wrapper, and control server. The desktop sync prototype is ready for a trial with a disposable world.
+
+- [Run the sync client and server](docs/sync.md) for setup, a two-device walkthrough, backups, and recovery.
+- [Test from Windows Steam](docs/windows-steam.md) using the disposable Windows kit and optional Dockur guest.
+- [Read the product and protocol spec](SPEC.md) for design decisions and planned features.
+- [Run the Steam Deck launch probe](#buddy-launch-probe) to measure when Game Mode lets post-game work finish. This is a separate executable and experiment.
+
+## Buddy launch probe
+
+This prototype measures when Steam's launch command returns, whether the game outlives it, and whether an independent worker can still finish work after Steam stops the game. The worker captures a tiny test marker and writes a receipt three seconds later. Real games run with their original arguments and working directory. All probe writes go to the probe's own session directory. You can test with Steam Cloud left as it is.
+
+## Get it onto both machines
+
+**On this Arch desktop**, the x86-64 Linux executable is already installed at `/home/foxfire/.local/bin/buddy-probe`. To check the Steam libraries:
+
+```sh
+~/.local/bin/buddy-probe libraries
+~/.local/bin/buddy-probe libraries 379720
+```
+
+The last command takes a Steam app ID. On this desktop, 379720 (DOOM) resolves to the second library under `/media/thicc_storage/steam`. The command lists every registered library, including unavailable drives, and identifies matching installs and existing Proton prefixes. A wrapped launch also records `STEAM_COMPAT_DATA_PATH/pfx` if Steam supplies that override.
+
+**On the Deck**, use the same binary. The Deck needs native Steam, a running user systemd manager, and either Zenity or KDialog for the optional test window. It needs no Rust toolchain. In Desktop Mode, copy the binary to `~/Downloads/buddy-probe` using USB, KDE Connect, or your usual transfer method. In Konsole:
+
+```sh
+install -Dm755 ~/Downloads/buddy-probe ~/.local/bin/buddy-probe
+~/.local/bin/buddy-probe libraries
+```
+
+If you already use SSH with the Deck, the desktop equivalent is below. Substitute its actual hostname or IP for `steamdeck`.
+
+```sh
+ssh deck@steamdeck 'mkdir -p ~/.local/bin'
+scp ~/.local/bin/buddy-probe deck@steamdeck:.local/bin/buddy-probe
+ssh deck@steamdeck 'chmod 755 ~/.local/bin/buddy-probe && ~/.local/bin/buddy-probe libraries'
+```
+
+## Start with a disposable game
+
+1. On each machine, use Steam's **Games → Add a Non-Steam Game → Browse** and select the installed `buddy-probe`. In the picker, Ctrl+H shows the hidden `.local` folder. Name the shortcut **Buddy test game**.
+2. Under **Properties → Shortcut**, set **Launch Options** to just `demo-window`. Keep **Force the use of a specific Steam Play compatibility tool** unchecked for this native fixture.
+3. On the desktop, press **Play**, wait until the test window appears, then press **OK**. About six seconds after exit, run `~/.local/bin/buddy-probe report`. Look for `fixture_saved`, `wrapper_return`, `boundary_observed`, `receipt_written`, and `fixture=saved-on-quit`.
+4. Return the Deck to **Game Mode** and run the cases below. Use touch on the test window if Steam Input doesn't focus the OK button. Record any focus issue. From the desktop you can read the Deck report while it stays in Game Mode with `ssh deck@steamdeck '~/.local/bin/buddy-probe report'`. Without SSH, allow the worker to finish before returning to Desktop Mode and use Konsole to read the reports.
+
+| Case | Do this | What to look for |
+| --- | --- | --- |
+| Normal exit | Press OK in the Deck test window. | The receipt contains `saved-on-quit`. The source game saved before the worker captured it. |
+| Steam overlay stop | Launch again, leave the window open for five seconds, then use Steam's **Exit game** or **Stop Game**. | A receipt should still appear. `wrapper_gone … exit hook missing` means the worker survived a wrapper that never returned. An `opened` marker means the fixture was stopped before its graceful save. That is a valid interrupted result. |
+| Suspend and resume | Leave the window open, tap Power, wait at least 15 seconds, wake the Deck, and leave the window open another five seconds before pressing OK. | One session ID throughout. Look for a `sampling_gap` around sleep. No boundary or receipt should appear while the game is still open. The final receipt should contain `saved-on-quit`. A wall-clock gap alone cannot identify suspend. |
+| Immediate Deck → desktop handoff | Stop or quit the Deck fixture and immediately press Play on the **desktop fixture**. If using SSH, check the Deck report as soon as the desktop window opens and again six seconds later. | Record both session IDs and whether the Deck receipt already existed at desktop launch. If it appeared later, you've measured the interval a future lease must cover. Both fixtures can run independently in this probe. |
+| Detached launcher | In a terminal on either machine, run `~/.local/bin/buddy-probe demo-detached`, keep the terminal open, wait nine seconds, then run `~/.local/bin/buddy-probe report`. | `wrapper_return` precedes `fixture_saved`, which precedes `boundary_observed`. The receipt must contain `saved-on-quit`. |
+
+## Repeat with a real game
+
+Choose a game installed on both devices, ideally a Proton game on a secondary drive or the Deck's microSD. In Steam, copy the game's existing Launch Options somewhere so you can restore them. For an empty options field, paste the appropriate line under **Properties → General → Launch Options**.
+
+**This desktop**
+
+```text
+"/home/foxfire/.local/bin/buddy-probe" run -- %command%
+```
+
+**Steam Deck**
+
+```text
+"/home/deck/.local/bin/buddy-probe" run -- %command%
+```
+
+If the existing options are `mangohud %command% -windowed`, for example, use `"/home/deck/.local/bin/buddy-probe" run -- mangohud %command% -windowed` on the Deck. Keep any leading shell environment assignments before Buddy. If your existing options contain pipelines or other shell logic, use a different game with empty options for the baseline.
+
+Play to the title screen first. Verify input, overlay, and the ability to exit normally. Repeat the normal exit, overlay stop, and suspend cases, comparing the game's visible lifetime with the trace. Use the disposable fixture for forced stops around writes. In the real-game report, check the app ID, matching install directory, and prefix path against **Steam → Settings → Storage**. A real-game receipt records only timing and process evidence. The probe never opens the game's saves.
+
+**What counts as a failed boundary test?** A receipt while the game is visibly running is an early detection. No receipt ten seconds after the game and its helpers have closed is worth investigating. If a launcher hands off to an already-running process, or a child closes inherited descriptors and detaches between samples, the worker can miss it. If an unrelated helper inherits the descriptor, the worker can wait too long. Those are exactly the cases this experiment should uncover.
+
+## Read or share a result
+
+```sh
+~/.local/bin/buddy-probe sessions
+~/.local/bin/buddy-probe report
+~/.local/bin/buddy-probe report SESSION-ID
+```
+
+Each run has a directory under `~/.local/state/buddy-probe/<session-id>/`. Timestamps are Unix milliseconds on the originating device. Compare event order within one trace, or check receipt presence over SSH to avoid assuming both device clocks agree. To share a result, capture `buddy-probe report SESSION-ID` and note the device, game, quit method, storage device, and whether the game was visibly still open at `boundary_observed`. Reports include local filesystem paths.
+
+If no report appears, verify the executable path and its execute bit. If the report stops at `wrapper_started`, check `systemctl --user is-system-running` and `journalctl --user -u buddy-probe-SESSION-ID.service`. A working run shows different cgroups for `wrapper_started` and `observer_ready`. The service is transient. Native Steam is the target of this experiment. A Flatpak PID namespace or inaccessible host user bus can prevent the observer from arming.
+
+When finished, restore the real game's original Launch Options and remove the disposable Steam shortcut. No persistent service was installed.
+
+## Build and reproduce the desktop checks
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --locked --release --target x86_64-unknown-linux-musl
+python3 tests/boundary.py target/x86_64-unknown-linux-musl/release/buddy-probe
+install -Dm755 target/x86_64-unknown-linux-musl/release/buddy-probe ~/.local/bin/buddy-probe
+```
+
+The smoke suite uses synthetic files and transient user services on the local machine. It checks a normal exit, a detached child, forced wrapper death, argument and exit-code preservation, and finding a game in a second library after an unavailable drive. It requires a real user service bus. Steam overlay behavior, Deck controller focus, and suspend still need the hardware cases above.

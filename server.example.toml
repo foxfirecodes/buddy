@@ -1,0 +1,6 @@
+# Use a TLS reverse proxy in front of this listener for other devices.
+listen = "127.0.0.1:7341"
+database = "buddy-data/server.sqlite3"
+
+# Optional physical chunk allowance per account, in bytes.
+# account_quota_bytes = 107374182400

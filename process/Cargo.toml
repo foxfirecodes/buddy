@@ -1,0 +1,16 @@
+[package]
+name = "buddy-process"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+tempfile = "3"
+signal-hook = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+# This upstream fix waits for the job's active-process count to reach zero.
+# The published 10.0.1 still returns after the first completion notification.
+process-wrap = { git = "https://github.com/watchexec/process-wrap.git", rev = "ccb58857b0bad6e3d8b85b7c9041bd407aa4cd1b", default-features = false, features = ["std", "job-object"] }

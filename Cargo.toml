@@ -1,0 +1,19 @@
+[package]
+name = "buddy-probe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+
+[dependencies]
+buddy-process = {path="process"}
+libc = "0.2"
+steamlocate = "2.1.1"
+
+[profile.release]
+strip = true
+
+[workspace]
+members = ["buddy", "process"]
+default-members = ["."]
+resolver = "3"

@@ -1,0 +1,28 @@
+name: buddy-windows-trial
+services:
+  windows:
+    image: dockurr/windows:6.06@sha256:59f8bed19cfd49cf1701debe34f9df6311e61a4e2ae68aa9f41206e2184e31cc
+    environment:
+      VERSION: "11"
+      CPU_CORES: "4"
+      RAM_SIZE: "8G"
+      DISK_SIZE: "80G"
+      USERNAME: BuddyTester
+      PASSWORD: ${BUDDY_VM_PASSWORD:?Set BUDDY_VM_PASSWORD for the disposable Windows guest}
+    devices:
+      - /dev/kvm
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "127.0.0.1:8006:8006"
+    volumes:
+      - windows-disk:/storage
+      - type: bind
+        source: ../../target/windows-steam-kit
+        target: /shared
+        bind:
+          create_host_path: false
+    stop_grace_period: 2m
+volumes:
+  windows-disk:

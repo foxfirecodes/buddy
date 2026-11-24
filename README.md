@@ -2,9 +2,11 @@
 
 Buddy syncs selected game saves and settings between devices. The native Rust app includes the graphical client, command-line and terminal clients, Steam wrapper, and control server. The desktop sync prototype is ready for a trial with a disposable world.
 
+To build the sync app from source, run `cargo build --locked --release -p buddy` from the repository root. Open `target/release/buddy` on Linux or `target\release\buddy.exe` on Windows to start the graphical client.
+
 - [Set up Buddy on your home network](docs/onboarding.md) to host an HTTPS server, pair a second device, and preview the files you want to sync.
 - [Run the sync client and server](docs/sync.md) for setup, a two-device walkthrough, backups, and recovery.
-- [Test from Windows Steam](docs/windows-steam.md) using the disposable Windows kit and optional Dockur guest.
+- [Test from Windows Steam](docs/windows-steam.md) with a disposable game on Windows or in a Dockur guest.
 - [Restore both sides of an offline Terraria conflict](docs/offline-terraria.md), [restore before a first Proton launch](docs/proton-first-play.md), or [reproduce the large-world and disk-full trials](docs/storage-trial.md).
 - [Read the product and protocol spec](SPEC.md) for design decisions and planned features.
 - [Run the Steam Deck launch probe](#buddy-launch-probe) to measure when Game Mode lets post-game work finish. This is a separate executable and experiment.
@@ -15,14 +17,16 @@ This prototype measures when Steam's launch command returns, whether the game ou
 
 ## Get it onto both machines
 
-**On this Arch desktop**, the x86-64 Linux executable is already installed at `/home/foxfire/.local/bin/buddy-probe`. To check the Steam libraries:
+**On an x86-64 Linux desktop**, build the probe from the repository root with Rust 1.89 or later. This produces one executable you can use on both the desktop and the Deck.
 
 ```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --locked --release -p buddy-probe --target x86_64-unknown-linux-musl
+install -Dm755 target/x86_64-unknown-linux-musl/release/buddy-probe ~/.local/bin/buddy-probe
 ~/.local/bin/buddy-probe libraries
-~/.local/bin/buddy-probe libraries 379720
 ```
 
-The last command takes a Steam app ID. On this desktop, 379720 (DOOM) resolves to the second library under `/media/thicc_storage/steam`. The command lists every registered library, including unavailable drives, and identifies matching installs and existing Proton prefixes. A wrapped launch also records `STEAM_COMPAT_DATA_PATH/pfx` if Steam supplies that override.
+`libraries` lists every registered Steam library, including unavailable drives. To find a particular game's install directory and any existing Proton prefix, run `~/.local/bin/buddy-probe libraries APPID`, replacing `APPID` with its numeric Steam app ID. A wrapped launch also records `STEAM_COMPAT_DATA_PATH/pfx` if Steam supplies that override.
 
 **On the Deck**, use the same binary. The Deck needs native Steam, a running user systemd manager, and either Zenity or KDialog for the optional test window. It needs no Rust toolchain. In Desktop Mode, copy the binary to `~/Downloads/buddy-probe` using USB, KDE Connect, or your usual transfer method. In Konsole:
 
@@ -31,12 +35,13 @@ install -Dm755 ~/Downloads/buddy-probe ~/.local/bin/buddy-probe
 ~/.local/bin/buddy-probe libraries
 ```
 
-If you already use SSH with the Deck, the desktop equivalent is below. Substitute its actual hostname or IP for `steamdeck`.
+If you already use SSH with the Deck, you can copy the probe directly from the desktop. Set `deck_host` to the SSH username and hostname or IP address you use for your Deck.
 
 ```sh
-ssh deck@steamdeck 'mkdir -p ~/.local/bin'
-scp ~/.local/bin/buddy-probe deck@steamdeck:.local/bin/buddy-probe
-ssh deck@steamdeck 'chmod 755 ~/.local/bin/buddy-probe && ~/.local/bin/buddy-probe libraries'
+deck_host=deck@steamdeck
+ssh "$deck_host" 'mkdir -p ~/.local/bin'
+scp ~/.local/bin/buddy-probe "$deck_host:.local/bin/buddy-probe"
+ssh "$deck_host" 'chmod 755 ~/.local/bin/buddy-probe && ~/.local/bin/buddy-probe libraries'
 ```
 
 ## Start with a disposable game
@@ -44,7 +49,7 @@ ssh deck@steamdeck 'chmod 755 ~/.local/bin/buddy-probe && ~/.local/bin/buddy-pro
 1. On each machine, use Steam's **Games → Add a Non-Steam Game → Browse** and select the installed `buddy-probe`. In the picker, Ctrl+H shows the hidden `.local` folder. Name the shortcut **Buddy test game**.
 2. Under **Properties → Shortcut**, set **Launch Options** to just `demo-window`. Keep **Force the use of a specific Steam Play compatibility tool** unchecked for this native fixture.
 3. On the desktop, press **Play**, wait until the test window appears, then press **OK**. About six seconds after exit, run `~/.local/bin/buddy-probe report`. Look for `fixture_saved`, `wrapper_return`, `boundary_observed`, `receipt_written`, and `fixture=saved-on-quit`.
-4. Return the Deck to **Game Mode** and run the cases below. Use touch on the test window if Steam Input doesn't focus the OK button. Record any focus issue. From the desktop you can read the Deck report while it stays in Game Mode with `ssh deck@steamdeck '~/.local/bin/buddy-probe report'`. Without SSH, allow the worker to finish before returning to Desktop Mode and use Konsole to read the reports.
+4. Return the Deck to **Game Mode** and run the cases below. Use touch on the test window if Steam Input doesn't focus the OK button. Record any focus issue. If you set up SSH above, run `ssh "$deck_host" '~/.local/bin/buddy-probe report'` from the same desktop terminal to read the report while the Deck stays in Game Mode. Otherwise, allow the worker to finish before returning to Desktop Mode and use Konsole to read the reports.
 
 | Case | Do this | What to look for |
 | --- | --- | --- |
@@ -56,21 +61,15 @@ ssh deck@steamdeck 'chmod 755 ~/.local/bin/buddy-probe && ~/.local/bin/buddy-pro
 
 ## Repeat with a real game
 
-Choose a game installed on both devices, ideally a Proton game on a secondary drive or the Deck's microSD. In Steam, copy the game's existing Launch Options somewhere so you can restore them. For an empty options field, paste the appropriate line under **Properties → General → Launch Options**.
+Choose a game installed on both devices. A Proton game on a secondary drive or the Deck's microSD also exercises library and prefix discovery. Save the game's existing Steam Launch Options so you can restore them later.
 
-**This desktop**
+On each device, run this in a terminal to print the Steam launch option with the full path to your installed probe. For an empty options field, paste the output into **Properties → General → Launch Options**.
 
-```text
-"/home/foxfire/.local/bin/buddy-probe" run -- %command%
+```sh
+printf '"%s" run -- %%command%%\n' "$HOME/.local/bin/buddy-probe"
 ```
 
-**Steam Deck**
-
-```text
-"/home/deck/.local/bin/buddy-probe" run -- %command%
-```
-
-If the existing options are `mangohud %command% -windowed`, for example, use `"/home/deck/.local/bin/buddy-probe" run -- mangohud %command% -windowed` on the Deck. Keep any leading shell environment assignments before Buddy. If your existing options contain pipelines or other shell logic, use a different game with empty options for the baseline.
+If you already use `mangohud %command% -windowed`, replace just the `%command%` in the printed line with that entire expression. Keep any leading shell environment assignments before Buddy. If your existing options contain pipelines or other shell logic, use a different game with empty options for the baseline.
 
 Play to the title screen first. Verify input, overlay, and the ability to exit normally. Repeat the normal exit, overlay stop, and suspend cases, comparing the game's visible lifetime with the trace. Use the disposable fixture for forced stops around writes. In the real-game report, check the app ID, matching install directory, and prefix path against **Steam → Settings → Storage**. A real-game receipt records only timing and process evidence. The probe never opens the game's saves.
 
@@ -92,11 +91,10 @@ When finished, restore the real game's original Launch Options and remove the di
 
 ## Build and reproduce the desktop checks
 
+After [building the probe](#get-it-onto-both-machines), run the smoke suite from the repository root on Linux.
+
 ```sh
-rustup target add x86_64-unknown-linux-musl
-cargo build --locked --release --target x86_64-unknown-linux-musl
 python3 tests/boundary.py target/x86_64-unknown-linux-musl/release/buddy-probe
-install -Dm755 target/x86_64-unknown-linux-musl/release/buddy-probe ~/.local/bin/buddy-probe
 ```
 
 The smoke suite uses synthetic files and transient user services on the local machine. It checks a normal exit, a detached child, forced wrapper death, argument and exit-code preservation, and finding a game in a second library after an unavailable drive. It requires a real user service bus. Steam overlay behavior, Deck controller focus, and suspend still need the hardware cases above.

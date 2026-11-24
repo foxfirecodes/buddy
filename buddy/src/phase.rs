@@ -60,18 +60,6 @@ pub fn style(ctx: &egui::Context) {
             state.corner_radius = 5.into();
         }
     });
-    // Decode the approved wordmark once per GUI context, including on high-DPI displays.
-    let art = eframe::icon_data::from_png_bytes(include_bytes!("../assets/phase-brand.png"))
-        .expect("embedded Phase wordmark");
-    let texture = ctx.load_texture(
-        "Phase wordmark",
-        egui::ColorImage::from_rgba_unmultiplied(
-            [art.width as usize, art.height as usize],
-            &art.rgba,
-        ),
-        egui::TextureOptions::LINEAR,
-    );
-    ctx.data_mut(|data| data.insert_temp(Id::new("phase-brand"), texture));
 }
 
 pub fn app_icon() -> egui::IconData {
@@ -79,13 +67,48 @@ pub fn app_icon() -> egui::IconData {
         .expect("embedded Phase icon")
 }
 
+fn wordmark_source() -> &'static image::RgbaImage {
+    static SOURCE: std::sync::OnceLock<image::RgbaImage> = std::sync::OnceLock::new();
+    SOURCE.get_or_init(|| {
+        let mut source = image::load_from_memory(include_bytes!("../assets/phase-brand.png"))
+            .expect("embedded Phase wordmark")
+            .into_rgba8();
+        // The resize filter expects premultiplied color at transparent edges.
+        for pixel in source.pixels_mut() {
+            let [r, g, b, a] = pixel.0;
+            pixel.0 = Color32::from_rgba_unmultiplied(r, g, b, a).to_array();
+        }
+        source
+    })
+}
+
 pub fn brand(ui: &mut Ui) {
-    let texture = ui
-        .ctx()
-        .data(|data| data.get_temp::<egui::TextureHandle>(Id::new("phase-brand")));
-    if let Some(texture) = texture {
-        ui.add(egui::Image::new((texture.id(), vec2(148.5, 33.))).alt_text("Buddy"));
-    }
+    let source = wordmark_source();
+    let native = vec2(source.width() as f32, source.height() as f32);
+    let size = native * (33. / native.y);
+    let pixels = (size * ui.pixels_per_point())
+        .round()
+        .clamp(vec2(1., 1.), native);
+    let key = Id::new("phase-brand");
+    let cached = ui.data(|data| data.get_temp::<egui::TextureHandle>(key));
+    let texture = cached
+        .filter(|t| t.size_vec2() == pixels)
+        .unwrap_or_else(|| {
+            let (w, h) = (pixels.x as u32, pixels.y as u32);
+            let scaled =
+                image::imageops::resize(source, w, h, image::imageops::FilterType::Lanczos3);
+            let image =
+                egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], &scaled);
+            let filter = if pixels == native {
+                egui::TextureOptions::LINEAR
+            } else {
+                egui::TextureOptions::NEAREST
+            };
+            let texture = ui.ctx().load_texture("Phase wordmark", image, filter);
+            ui.data_mut(|data| data.insert_temp(key, texture.clone()));
+            texture
+        });
+    ui.add(egui::Image::new((texture.id(), size)).alt_text("Buddy"));
 }
 
 pub fn primary(label: &str) -> egui::Button<'static> {

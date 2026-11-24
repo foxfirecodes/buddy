@@ -1,5 +1,5 @@
-# Loopback HTTP can sit behind a TLS reverse proxy. The graphical Host server window
-# generates a LAN HTTPS configuration and a pairing file for other devices.
+# Set listen to the local IP and port to serve. Plain HTTP on a non-loopback
+# address prints a startup warning. Use [IPv6]:port for an IPv6 address.
 listen = "127.0.0.1:7341"
 database = "buddy-data/server.sqlite3"
 

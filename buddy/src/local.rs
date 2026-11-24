@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::BTreeMap,
     fs,
-    net::IpAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -345,16 +344,11 @@ pub fn canonical_url(url: &str) -> Result<String> {
             && u.fragment().is_none(),
         "enter a server URL without credentials, query or fragment"
     );
-    let host = u
-        .host_str()
-        .context("missing host")?
-        .trim_matches(['[', ']']);
-    let loopback = host.eq_ignore_ascii_case("localhost")
-        || host.parse::<IpAddr>().is_ok_and(|a| a.is_loopback());
     ensure!(
-        u.scheme() == "https" || u.scheme() == "http" && loopback,
-        "use HTTPS for remote servers"
+        matches!(u.scheme(), "http" | "https"),
+        "use an HTTP or HTTPS server URL"
     );
+    ensure!(u.has_host(), "missing host");
     Ok(u.as_str().trim_end_matches('/').to_owned())
 }
 #[derive(Clone)]

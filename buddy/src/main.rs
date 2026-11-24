@@ -45,6 +45,8 @@ enum Cmd {
     Decision,
     #[command(hide = true, name = "_progress")]
     Progress,
+    /// Copy the default server.toml to the current directory.
+    InitServer,
     /// Start the control server.
     Serve {
         #[arg(long, default_value = "server.toml")]
@@ -207,6 +209,11 @@ fn dispatch(args: Args) -> Result<i32> {
         Cmd::Decision => return ui::decision_window(),
         Cmd::Progress => {
             ui::progress_window()?;
+            return Ok(0);
+        }
+        Cmd::InitServer => {
+            server::init_config()?;
+            println!("Created server.toml");
             return Ok(0);
         }
         Cmd::Serve { config } => {

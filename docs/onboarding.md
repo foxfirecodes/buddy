@@ -9,7 +9,7 @@
 
 ## Connect each device
 
-In Buddy, choose **Join a server**. On the host computer, choose **Use my hosted server**. On another device, choose **Open pairing file…** and select the exported JSON. For a server using a system-trusted HTTPS certificate, expand **Enter server address** and enter its URL. Compare the address and fingerprint shown in Buddy with the ones in the host window.
+In Buddy, choose **Join a server**. On the host computer, choose **Use my hosted server**. On another device, choose **Open pairing file…** and select the exported JSON. Compare the address and certificate fingerprint with the ones in the host window. For a manually configured HTTP server or a server using a system-trusted HTTPS certificate, expand **Enter server address** and enter its URL. [Headless server setup](sync.md#start-a-server-and-sign-in)
 
 Choose **Use an invite** on the first device. Enter the invite, account name, password, and device name and choose **Create account**. On the second device, sign into the same account and give the device a different name. A second player can create a separate account using their own invite.
 

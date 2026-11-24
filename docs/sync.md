@@ -6,15 +6,20 @@ Use a disposable world for the first run. Buddy can replace selected files on a 
 
 This workspace also contains ready-built x86-64 executables. Use `target/release/buddy` on this desktop, `target/x86_64-unknown-linux-gnu/release/buddy` for the portable Linux build, and `target/x86_64-pc-windows-gnullvm/release/buddy.exe` on Windows. For the Deck sync trial, copy the portable Linux file to `~/Downloads/buddy`, switch to Desktop Mode and run `install -Dm755 ~/Downloads/buddy ~/.local/bin/buddy` followed by `~/.local/bin/buddy`. It targets glibc 2.28. The Game Mode exit experiment uses the separate `buddy-probe` binary.
 
-For graphical hosting on your home network, choose **Host a server** when opening Buddy, or **Settings → Host a server** from the library. [Pairing walkthrough](onboarding.md) For the headless loopback setup, run these commands in a terminal. The invite printed by the second command is valid for one new account for 24 hours.
+For graphical hosting on your home network, choose **Host a server** when opening Buddy, or **Settings → Host a server** from the library. [Pairing walkthrough](onboarding.md)
+
+For headless hosting, run the installed binary in the directory where you want to keep the server settings and data.
 
 ```sh
-cargo build --release --locked -p buddy
-target/release/buddy invite --config server.example.toml
-target/release/buddy serve --config server.example.toml
+buddy init-server
+# Edit listen in server.toml before starting the server.
+buddy invite
+buddy serve
 ```
 
-Keep the server terminal open. In another terminal run `target/release/buddy`. Choose **Join a server**, expand **Enter server address**, and enter `http://127.0.0.1:7341`. Choose **Use an invite**, then enter the invite, an account name, a password, and a device name such as **Desktop**. Sign the second device into the same account with its own device name. Use another invite for another player's private saves.
+`init-server` copies the bundled example to `./server.toml` and preserves any existing file. The default listener is `127.0.0.1:7341`. To reach Buddy from another device, set `listen` to the server's address on the desired interface, for example `"192.168.1.20:7341"`, or use `"0.0.0.0:7341"` for all IPv4 interfaces. An IPv6 address takes brackets, as in `"[fd00::20]:7341"`. Plain HTTP on a non-loopback address starts with a warning because Buddy sends credentials and saves without TLS.
+
+Keep the server terminal open. On each client choose **Join a server → Enter server address** and enter the reachable URL, for example `http://192.168.1.20:7341`. Choose **Use an invite**, then enter the invite, an account name, a password, and a device name such as **Desktop**. An invite is valid for one new account for 24 hours. Sign the second device into the same account with its own device name.
 
 The shipped TOML puts the database, including file chunks, under `buddy-data/` next to the settings file. To use another location, copy the TOML, edit `database`, and pass that file to both commands. Normal sign-in uses the OS credential vault. If the device lacks an unlocked vault, **Credential storage** offers an explicit private-file option. On a shared PC, use separate OS accounts for different players. A local OS user able to read the server database can read its saves.
 

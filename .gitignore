@@ -1,3 +1,4 @@
 /target/
 /buddy-data/
+/server.toml
 /tests/__pycache__/

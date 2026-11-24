@@ -4,6 +4,8 @@ Buddy syncs selected game saves and settings between devices. The native Rust ap
 
 To build the sync app from source, run `cargo build --locked --release -p buddy` from the repository root. Open `target/release/buddy` on Linux or `target\release\buddy.exe` on Windows to start the graphical client.
 
+For headless hosting, run `buddy init-server` in the directory where you want to keep your server settings. Edit `listen` in `server.toml`, then run `buddy invite` and `buddy serve`. Plain HTTP on a non-loopback address prints a warning and starts normally.
+
 - [Set up Buddy on your home network](docs/onboarding.md) to host an HTTPS server, pair a second device, and preview the files you want to sync.
 - [Run the sync client and server](docs/sync.md) for setup, a two-device walkthrough, backups, and recovery.
 - [Test from Windows Steam](docs/windows-steam.md) with a disposable game on Windows or in a Dockur guest.

@@ -1,8 +1,9 @@
-"""Exercise the shipping binary with an HTTP server and isolated client profiles."""
+"""Exercise HTTP sync with isolated profiles. Optional second argument: local IP to bind."""
+import ipaddress
 import json
 import os
 from pathlib import Path
-import socket
+import secrets
 import sqlite3
 import subprocess
 import sys
@@ -31,21 +32,32 @@ def post(url, route, value, token=""):
         return json.load(r)
 
 
-def main(root):
+def main(root, address):
     config = root / "server.toml"
-    config.write_text('listen = "127.0.0.1:0"\ndatabase = "state.sqlite"\n')
+    init = [binary, "init-server"]
+    subprocess.run(init, cwd=root, check=True, capture_output=True)
+    example = Path(__file__).resolve().parents[1] / "server.example.toml"
+    assert config.read_bytes() == example.read_bytes()
+    host = f"[{address}]" if address.version == 6 else str(address)
+    settings = f'listen = "{host}:0"\ndatabase = "state.sqlite"\n'
+    config.write_text(settings)
+    assert subprocess.run(init, cwd=root, capture_output=True).returncode != 0
+    assert config.read_text() == settings
     user_a, user_b, other = [root / a for a in ("client-a", "client-b", "other")]
     env = {"BUDDY_ALLOW_FILE_CREDENTIAL": "true"}
-    server = subprocess.Popen([binary, "serve", "--config", str(config)], stderr=subprocess.PIPE, text=True)
+    password = secrets.token_urlsafe(24)
+    server = subprocess.Popen([binary, "serve"], cwd=root, stderr=subprocess.PIPE, text=True)
     try:
         line = server.stderr.readline().strip()
         assert line.startswith("Buddy listening on "), line
-        url = "http://" + line.split()[-1]
+        listener = line.split()[-1]
+        assert ipaddress.ip_address(listener.rsplit(":", 1)[0].strip("[]")) == address
+        url = "http://" + listener
         for profile, name, host, new in [(user_a, "player", "desktop", True), (user_b, "player", "deck", False), (other, "guest", "guest-device", True)]:
             args = ["login", url, name, "--device", host, "--password-stdin"]
             if new:
                 args += ["--invite", cli(profile, "invite", "--config", config).strip()]
-            cli(profile, *args, input="testing-password\n", extra=env)
+            cli(profile, *args, input=password + "\n", extra=env)
         a, b, g = [root / a for a in ("world A", "world B", "guest world")]
         for d in (a,b,g):
             d.mkdir()
@@ -104,7 +116,7 @@ def main(root):
         assert db.execute("SELECT head FROM games WHERE account='player'").fetchone() == (head,)
         print("PASS retention, manual restore, deletion, private saves, shared recipe", flush=True)
         def login(name):
-            return post(url, "/v1/login", {"account":"player","password":"testing-password","device":name,"invite":None})
+            return post(url, "/v1/login", {"account":"player","password":password,"device":name,"invite":None})
         x, y = login("one"), login("two")
         def rpc(tok, action, **fields):
             return post(url, "/v1/rpc", dict(action=action, **fields), tok)
@@ -124,8 +136,12 @@ def main(root):
     finally:
         server.terminate()
         server.wait(timeout=10)
+    stderr = server.stderr.read()
+    ip = getattr(address, "ipv4_mapped", None) or address
+    assert stderr.count("Warning: serving HTTP") == (0 if ip.is_loopback else 1), stderr
+    print("PASS server config bootstrap, overwrite protection and HTTP startup warning", flush=True)
 
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
-        main(Path(tmp))
+        main(Path(tmp), ipaddress.ip_address(sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"))

@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     fs,
+    io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
@@ -176,6 +177,16 @@ fn check_quota(tx: &Transaction, s: &Store, account: &str) -> Result<()> {
     }
     Ok(())
 }
+pub fn init_config() -> Result<()> {
+    let mut config = tempfile::NamedTempFile::new_in(".").context("create server.toml")?;
+    config.write_all(include_bytes!("../../server.example.toml"))?;
+    config.as_file().sync_all()?;
+    config
+        .persist_noclobber("server.toml")
+        .map_err(|err| err.error)
+        .context("create server.toml")?;
+    Ok(())
+}
 pub fn serve(path: &Path) -> Result<()> {
     serve_controlled(path, axum_server::Handle::new(), |addr| {
         eprintln!("Buddy listening on {addr}")
@@ -187,10 +198,6 @@ pub fn serve_controlled(
     ready: impl FnOnce(SocketAddr),
 ) -> Result<()> {
     let (s, cfg) = Store::open(path)?;
-    ensure!(
-        cfg.tls.is_some() || cfg.listen.ip().is_loopback(),
-        "set listen to a loopback address for HTTP, or configure a TLS certificate and private key"
-    );
     tokio::runtime::Runtime::new()?.block_on(async move {
         let maintenance = s.clone();
         tokio::spawn(async move {
@@ -237,6 +244,9 @@ pub fn serve_controlled(
             server.serve(service).await?;
         } else {
             ready(addr);
+            if !addr.ip().to_canonical().is_loopback() {
+                eprintln!("Warning: serving HTTP on {addr}. Buddy sends passwords, device tokens, and save data without TLS.");
+            }
             axum::serve(tokio::net::TcpListener::from_std(listener)?, service).await?;
         }
         Ok(())

@@ -276,9 +276,41 @@ function traces(canvas, progress, header=false) {
   ctx.save();ctx.beginPath();ctx.rect(0,0,w*progress,h);ctx.clip();ctx.strokeStyle=orange;
   if(!header){ctx.shadowColor="#ff681e70";ctx.shadowBlur=4} ctx.stroke(path);ctx.restore();
 }
+// A disk label drawn from the game ID gives custom and offline games a stable cover.
+function drawDiskLabel(ctx,w,h,id) {
+  let seed=5381;
+  for(const letter of id) seed=(Math.imul(seed,33)^letter.codePointAt(0))>>>0;
+  const side=Math.min(w*.4,h*1.18);
+  ctx.fillStyle="#242120";ctx.fillRect(0,0,w,h);
+  ctx.save();
+  ctx.translate(w*.74,h*.54);ctx.rotate(((seed%13)-6)*Math.PI/180);
+  ctx.scale(side/100,side/100);ctx.translate(-50,-50);
+  const shell=new Path2D("M5 1H84L99 16V95Q99 99 95 99H5Q1 99 1 95V5Q1 1 5 1Z");
+  ctx.fillStyle="#343131";ctx.fill(shell);ctx.lineWidth=1.2;ctx.strokeStyle="#706761";ctx.stroke(shell);
+  ctx.fillStyle="#171717";ctx.fillRect(21,1,54,34);ctx.fillStyle="#77726e";ctx.fillRect(24,1,47,31);
+  ctx.fillStyle="#242222";ctx.fillRect(53,4,10,23);
+  ctx.fillStyle="#c3b9a7";ctx.fillRect(10,49,80,44);
+  ctx.fillStyle="#302e2b";ctx.fillRect(10,48,80,7);
+  ctx.save();ctx.beginPath();ctx.rect(10,55,80,38);ctx.clip();
+  ctx.strokeStyle="#a74720";ctx.lineWidth=2.2;ctx.lineJoin="round";
+  const bend=25+((seed>>>8)%38),rise=(seed&1)?-11:11;
+  for(let i=0;i<3;i++){
+    const y=68+i*5;ctx.beginPath();ctx.moveTo(9,y);ctx.lineTo(bend,y);
+    ctx.lineTo(bend+15,y+rise);ctx.lineTo(91,y+rise);ctx.stroke();
+  }
+  ctx.restore();
+  ctx.fillStyle="#171717";ctx.fillRect(4,88,4,5);ctx.fillRect(92,88,4,5);
+  ctx.restore();
+}
+const previewCovers=new URLSearchParams(location.search).get("art");
 function paintScene(canvas) {
-  const s=surface(canvas);if(!s || !atlas.naturalWidth)return;
-  const {ctx,w,h}=s, idx=Number(canvas.dataset.art), sw=atlas.naturalWidth/2, sh=atlas.naturalHeight/2;
+  const s=surface(canvas);if(!s)return;
+  const {ctx,w,h}=s, game=games.find(g=>g.id===canvas.dataset.art);
+  const idx=game.art;
+  if(!atlas.naturalWidth || idx==null || previewCovers==="off" || (previewCovers==="mixed" && idx%2===1)){
+    drawDiskLabel(ctx,w,h,game.id);return;
+  }
+  const sw=atlas.naturalWidth/2, sh=atlas.naturalHeight/2;
   const scale=Math.max(w/sw,h/sh), cw=w/scale, ch=h/scale;
   const sx=(idx%2)*sw+(sw-cw)*.6, sy=Math.floor(idx/2)*sh+(sh-ch)*.49;
   ctx.imageSmoothingEnabled=true;ctx.drawImage(atlas,sx,sy,cw,ch,0,0,w,h);
@@ -327,7 +359,7 @@ function selectGame(g) {
 function listFiles(){return [...game.files,...added];}
 function card(g){
   const [glyph,label]=status(g);
-  return '<button class="card" data-game="'+g.id+'">'+scene(g.art)+'<span class="card-go">'+mark("arrow")+'</span><span><span class="card-title">'+g.title+'</span><span class="card-status">'+mark(glyph)+label+'</span></span></button>';
+  return '<button class="card" data-game="'+g.id+'">'+scene(g.id)+'<span class="card-go">'+mark("arrow")+'</span><span><span class="card-title">'+g.title+'</span><span class="card-status">'+mark(glyph)+label+'</span></span></button>';
 }
 function library(){
   main.innerHTML='<div class="title-line"><h1>Game library</h1><label class="search">'+mark("search")+
@@ -345,7 +377,7 @@ function row(f,checked,attr){
   return '<label class="file-row"><input type="checkbox" '+attr+'="'+f.name+'" '+(checked?"checked":"")+'><span class="file-icon">'+mark(f.children?"folder":"file")+'</span><span>'+f.name+'</span><span class="meta file-size">'+size(f.kb)+'</span></label>';
 }
 function filesView(){
-  main.innerHTML='<a class="crumb" href="#library">'+mark("back")+'Game library</a><div class="banner">'+scene(game.art)+'<h1>'+game.title+'</h1></div>'+
+  main.innerHTML='<a class="crumb" href="#library">'+mark("back")+'Game library</a><div class="banner">'+scene(game.id)+'<h1>'+game.title+'</h1></div>'+
     '<div class="tools"><h2>Files to sync</h2><button class="btn flat" data-action="browse">'+mark("plus")+'Add files</button></div>'+
     '<div class="file-layout"><section class="panel" aria-label="Available files"><div class="panel-head"><h2>Locations</h2></div><div id="file-rows">'+listFiles().map(f=>row(f,draft.has(f.name),"data-file")).join("")+'</div></section>'+
     '<section class="panel" aria-labelledby="included"><div class="panel-head"><h2 id="included">Included files</h2></div><ul class="tree-list"></ul></section></div>'+
@@ -391,7 +423,7 @@ function conflictView(){
   main.innerHTML='<section class="conflict"><div class="game-context">'+mark("game")+'Terraria</div><h1>'+(chosen?"Conflict resolved":"Save conflict")+'</h1>'+body+'</section>';draw();
 }
 function transferView(){
-  main.innerHTML='<section class="cinema" aria-label="Steam launch preview">'+scene(0)+'<div class="transfer">'+
+  main.innerHTML='<section class="cinema" aria-label="Steam launch preview">'+scene("terraria")+'<div class="transfer">'+
     '<div class="transfer-top"><div><div class="game-context">Terraria</div><h1 id="transfer-title"></h1></div><canvas class="floppy" aria-hidden="true"></canvas></div>'+
     '<div class="endpoints"><span>'+mark("server")+'Server</span><span>'+mark("desktop")+'Desktop</span></div>'+
     '<canvas class="progress-track" aria-hidden="true"></canvas><div class="transfer-foot" role="progressbar" aria-label="Save transfer" aria-valuemin="0" aria-valuemax="100"><span id="bytes"></span><strong id="percent"></strong></div>'+
@@ -464,6 +496,7 @@ picker.addEventListener("click",e=>{if(e.target===picker){const b=picker.getBoun
 window.addEventListener("hashchange",()=>navigate());
 window.addEventListener("resize",draw);
 atlas.addEventListener("load",draw);
+atlas.addEventListener("error",draw);
 selectGame(game);navigate(true);
 </script>
 </body>

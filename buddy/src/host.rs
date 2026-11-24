@@ -1,6 +1,6 @@
 use crate::{
     local::{Local, canonical_url},
-    server, ui,
+    phase, server, ui,
 };
 use anyhow::{Context, Result, ensure};
 use eframe::egui;
@@ -196,7 +196,7 @@ fn protect_dir(dir: &Path) -> Result<()> {
         result
     }
 }
-fn initialize(dir: &Path, addr: SocketAddr) -> Result<Pairing> {
+pub(crate) fn initialize(dir: &Path, addr: SocketAddr) -> Result<Pairing> {
     ensure!(
         addr.port() != 0 && !addr.ip().is_unspecified() && !addr.ip().is_multicast(),
         "choose this computer's network address and a port from 1 to 65535"
@@ -350,14 +350,14 @@ impl Host {
             }
         }
     }
-    fn export(&self, pair: &Pairing, path: &Path) -> Result<()> {
+    fn export(dir: &Path, pair: &Pairing, path: &Path) -> Result<()> {
         let path = std::path::absolute(path)?;
         let parent = path
             .parent()
             .context("choose a destination folder")?
             .canonicalize()?;
         ensure!(
-            !parent.starts_with(&self.dir),
+            !parent.starts_with(dir),
             "export outside the server data folder"
         );
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
@@ -368,67 +368,80 @@ impl Host {
         Ok(())
     }
     fn window(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Host a Buddy server");
-        ui.label(self.dir.display().to_string());
-        ui.add_space(8.);
+        ui.heading("Host a server");
         if let Some(p) = &self.pair {
-            ui.label(format!("Listening at {}", p.url));
-            ui.label("Keep this window open while your devices sync.");
-            ui.separator();
-            ui.label("On each device, open the pairing file in Buddy and check this fingerprint.");
-            ui.monospace(p.fingerprint());
-            if ui.button("Export pairing file…").clicked()
-                && let Some(path) = rfd::FileDialog::new().set_file_name(PAIR_FILE).save_file()
-            {
-                self.notice = match self.export(p, &path) {
-                    Ok(()) => "Pairing file exported.".into(),
-                    Err(e) => format!("{e:#}"),
-                };
-            }
-            if ui.button("Create account invite").clicked() {
-                match server::invite(&self.dir.join(CONFIG)) {
-                    Ok(code) => {
-                        self.invite = code;
-                        self.notice.clear();
+            ui.horizontal_wrapped(|ui| {
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(9., 12.), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 3., phase::ORANGE);
+                ui.strong("Listening");
+                ui.monospace(&p.url);
+            });
+            ui.weak("Keep this window open while devices sync.");
+            ui.add_space(4.);
+            phase::panel().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.strong("Pair a device");
+                ui.weak("Server fingerprint");
+                ui.monospace(p.fingerprint());
+                if ui.add(phase::primary("Export pairing file…")).clicked()
+                    && let Some(path) = rfd::FileDialog::new().set_file_name(PAIR_FILE).save_file()
+                {
+                    self.notice = match Self::export(&self.dir, p, &path) {
+                        Ok(()) => "Pairing file exported.".into(),
+                        Err(e) => format!("{e:#}"),
+                    };
+                }
+                ui.add_space(5.);
+                ui.separator();
+                ui.strong("Account invite");
+                if ui.button("Create account invite").clicked() {
+                    match server::invite(&self.dir.join(CONFIG)) {
+                        Ok(code) => {
+                            self.invite = code;
+                            self.notice.clear();
+                        }
+                        Err(e) => self.notice = format!("{e:#}"),
                     }
-                    Err(e) => self.notice = format!("{e:#}"),
                 }
-            }
-            if !self.invite.is_empty() {
-                ui.label("This invite creates one account and expires in 24 hours.");
-                if ui.button("Copy invite").clicked() {
-                    ui.ctx().copy_text(self.invite.clone());
+                if !self.invite.is_empty() {
+                    ui.weak("Single use · expires in 24 hours");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.monospace(&self.invite);
+                        if ui.button("Copy invite").clicked() {
+                            ui.ctx().copy_text(self.invite.clone());
+                        }
+                    });
                 }
-                ui.monospace(&self.invite);
-            }
-            ui.separator();
+            });
             if ui.button("Stop server").clicked()
                 && let Some(handle) = &self.handle
             {
                 handle.graceful_shutdown(Some(Duration::from_secs(10)));
             }
         } else {
-            ui.label("Choose the IP address this computer uses on your home network.");
-            ui.add_enabled_ui(self.handle.is_none() && !self.dir.exists(), |ui| {
-                ui.label("Host IP address");
-                ui.text_edit_singleline(&mut self.ip);
-                ui.label("Port");
-                ui.text_edit_singleline(&mut self.port);
+            phase::panel().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add_enabled_ui(self.handle.is_none() && !self.dir.exists(), |ui| {
+                    ui.label("Home-network IP address");
+                    ui.text_edit_singleline(&mut self.ip);
+                    ui.label("Port");
+                    ui.text_edit_singleline(&mut self.port);
+                });
+                if ui
+                    .add_enabled(self.handle.is_none(), phase::primary("Start HTTPS server"))
+                    .clicked()
+                    && let Err(e) = self.start()
+                {
+                    self.notice = format!("{e:#}");
+                }
+                if self.handle.is_some() {
+                    ui.spinner();
+                }
             });
-            if ui
-                .add_enabled(
-                    self.handle.is_none(),
-                    egui::Button::new("Start HTTPS server"),
-                )
-                .clicked()
-                && let Err(e) = self.start()
-            {
-                self.notice = format!("{e:#}");
-            }
-            if self.handle.is_some() {
-                ui.spinner();
-            }
         }
+        ui.collapsing("Server data folder", |ui| {
+            ui.monospace(self.dir.display().to_string());
+        });
         if !self.notice.is_empty() {
             ui.label(&self.notice);
         }
@@ -446,9 +459,27 @@ pub fn gui(local: Local) -> Result<()> {
                 first = false;
             }
             host.poll();
-            egui::CentralPanel::default().show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| host.window(ui));
-            });
+            egui::TopBottomPanel::top("host-brand")
+                .frame(
+                    egui::Frame::new()
+                        .fill(phase::PANEL)
+                        .inner_margin(egui::Margin::symmetric(17, 10)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        phase::brand(ui);
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width().min(170.), 18.),
+                            egui::Sense::hover(),
+                        );
+                        phase::traces(ui.painter(), rect, Some(1.));
+                    })
+                });
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(phase::INK).inner_margin(20))
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| host.window(ui));
+                });
             if host.handle.is_some() {
                 ctx.request_repaint_after(Duration::from_millis(150));
             }

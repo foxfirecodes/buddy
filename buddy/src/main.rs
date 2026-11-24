@@ -5,6 +5,7 @@ mod local;
 mod manifest;
 mod model;
 mod pack;
+mod phase;
 #[cfg(target_os = "linux")]
 mod proton;
 mod server;
@@ -173,6 +174,7 @@ fn options() -> RunOptions {
         manual: false,
         restore: None,
         pin: false,
+        expected_scope: None,
     }
 }
 fn cli_decisions(interactive: bool) -> Interface {
@@ -286,7 +288,11 @@ fn dispatch(args: Args) -> Result<i32> {
                     for r in setup::games(&l)? {
                         println!(
                             "{}\t{}\tinstalled={} configured={} shared={}",
-                            r.id, r.title, r.installed, r.local, r.shared
+                            r.id,
+                            r.title,
+                            r.installed,
+                            r.device == setup::DeviceState::Ready,
+                            r.shared
                         );
                     }
                 }

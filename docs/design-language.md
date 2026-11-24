@@ -29,4 +29,4 @@ Use the wide, low Buddy wordmark for the brand. Use a legible proportional sans 
 
 Use flat charcoal surfaces, thin borders and softly squared corners. Group related controls with roughly 8 points of space, and leave 16–24 points between sections. Keep orange concentrated around the next action or the current selection. Pair important states with text or a recognizable mark so color alone never carries the decision.
 
-Let rows wrap and comparison panels stack when space is tight. Keep values selectable where players may need to copy them. Focus must remain visible with a keyboard. Give controls short verb labels such as **Save selection** and **Decide later**. Add explanatory copy when it helps someone judge a consequence, identify a save, or recover from a failure.
+Let rows wrap and comparison panels stack when space is tight. Keep values selectable where players may need to copy them. Focus must remain visible with a keyboard. Give controls short verb labels such as **Save setup** and **Decide later**. Add explanatory copy when it helps someone judge a consequence, identify a save, or recover from a failure.

@@ -70,7 +70,7 @@ impl Launch {
         }
         Some(Self { compat, init })
     }
-    fn prepare(&self, ui: Interface) -> Result<PathBuf> {
+    fn prepare(&self, ui: Interface, game: &str) -> Result<PathBuf> {
         let prefix = self.compat.join("pfx");
         let user = prefix.join("drive_c/users/steamuser");
         if !user.is_dir() || !prefix.join("user.reg").is_file() {
@@ -90,7 +90,7 @@ impl Launch {
                 fs::create_dir(&self.compat)
                     .context("the Steam library or prefix parent must be available")?;
             }
-            let _progress = crate::ui::Progress::start(ui, "Initializing the Proton prefix…");
+            let _progress = crate::ui::Progress::start(ui, game, "Initializing the Proton prefix…");
             let status = Command::new(&self.init[0])
                 .args(&self.init[1..])
                 .env_remove("BUDDY_INVITE")
@@ -215,7 +215,7 @@ pub fn first_launch(
             if let (Some(saved), Some(launch)) = (&setup.approved_proton_prefix, &launch) {
                 let selected = launch.compat.join("pfx");
                 if selected.canonicalize().ok().as_ref() != Some(saved) {
-                    let ready = launch.prepare(ui)?;
+                    let ready = launch.prepare(ui, &setup.recipe.title)?;
                     bail!(
                         "Steam selected {}. Buddy’s approved prefix is {}. Reconnect the original drive or use Buddy to stop syncing the old selections and bind your saves in the new prefix.",
                         ready.display(),
@@ -230,7 +230,7 @@ pub fn first_launch(
     let Some(launch) = launch else {
         return existing.context("configure this game on this device first");
     };
-    let prefix = launch.prepare(ui)?;
+    let prefix = launch.prepare(ui, game)?;
     let remote = api.rpc::<Vec<GameInfo>>(Action::Games)?.into_iter().find(|g| g.recipe.game==game)
         .context("Proton is ready. Choose the save paths for this game in Buddy before pressing Play again.")?;
     remote.recipe.validate()?;

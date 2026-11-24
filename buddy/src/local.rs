@@ -196,6 +196,36 @@ impl Local {
     pub fn save(&self, c: &Credentials, s: &Setup) -> Result<()> {
         self.write(&self.game_key(c, &s.recipe.game), s)
     }
+    pub fn forget_provisional_setup(&self, c: &Credentials, game: &str) -> Result<()> {
+        self.db()?
+            .execute("DELETE FROM state WHERE k=?", [self.game_key(c, game)])?;
+        Ok(())
+    }
+    pub fn save_setup_with_roots(
+        &self,
+        c: &Credentials,
+        s: &Setup,
+        roots: &BTreeMap<String, PathBuf>,
+    ) -> Result<()> {
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        let game = &s.recipe.game;
+        let rows = [
+            (self.game_key(c, game), serde_json::to_string(s)?),
+            (
+                format!("roots/{}/{game}", self.scope(c)),
+                serde_json::to_string(roots)?,
+            ),
+        ];
+        for (key, value) in rows {
+            tx.execute(
+                "INSERT INTO state VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                params![key, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn lock(&self, key: &str) -> Result<fs::File> {
         let file = fs::OpenOptions::new()
             .read(true)
@@ -279,15 +309,8 @@ impl Local {
         self.write(&format!("launcher/{}/{game}", self.scope(&c)), &command)
     }
     pub fn bind_root(&self, game: &str, name: &str, path: &Path) -> Result<()> {
-        ensure!(
-            key(game)
-                && key(name)
-                && !matches!(
-                    name,
-                    "home" | "data" | "config" | "install" | "documents" | "pfx"
-                ),
-            "choose a custom root name"
-        );
+        ensure!(key(game), "invalid game ID");
+        validate_root_name(name)?;
         let c = self.credentials()?;
         let _lock = self.lock(&format!("{}:{game}", self.scope(&c)))?;
         let p = path.canonicalize()?;
@@ -301,6 +324,17 @@ impl Local {
         fs::create_dir_all(&path)?;
         Cache::open(path)
     }
+}
+pub fn validate_root_name(name: &str) -> Result<()> {
+    ensure!(
+        key(name)
+            && !matches!(
+                name,
+                "home" | "data" | "config" | "install" | "documents" | "pfx"
+            ),
+        "choose a custom root name"
+    );
+    Ok(())
 }
 pub fn canonical_url(url: &str) -> Result<String> {
     let u = reqwest::Url::parse(url.trim())?;
@@ -542,7 +576,7 @@ pub fn default_device() -> String {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "PC".into())
 }
-fn steam_installs() -> Vec<steamlocate::SteamDir> {
+pub(crate) fn steam_installs() -> Vec<steamlocate::SteamDir> {
     match std::env::var_os("BUDDY_STEAM_ROOT") {
         Some(p) => steamlocate::SteamDir::from_dir(Path::new(&p)).map(|s| vec![s]),
         None => steamlocate::locate_all(),

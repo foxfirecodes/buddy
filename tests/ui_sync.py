@@ -3,6 +3,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 from pathlib import Path
 import subprocess
 import sys
@@ -166,8 +167,18 @@ def run():
         assert "1 queued" in call("A","status","world")
         server,_=start(config)
         (b/"save").write_text("online B");call("B","sync","world")
+        def server_head():
+            with sqlite3.connect(root / "server.sqlite") as db:
+                return db.execute("SELECT head FROM games WHERE game='world'").fetchone()[0]
+        before=server_head()
         resolving=play("A",a,"after choosing server")
-        window("Which save should Buddy continue with?",["Left","Return"])
+        conflict_title="Which save should Buddy continue with?"
+        window(conflict_title,["Left"])
+        # Highlighting a version only selects it; publication requires confirmation.
+        window(conflict_title,None)
+        assert resolving.poll() is None and server_head()==before
+        assert (a/"save").read_text()=="offline A"
+        window(conflict_title,["Return"])
         assert resolving.wait(timeout=20)==0
         assert "0 queued" in call("A","status","world")
         history=call("A","backups","world")

@@ -652,6 +652,7 @@ dependencies = [
  "fastcdc",
  "glob",
  "hostname",
+ "image",
  "inquire",
  "keyring",
  "rcgen",
@@ -2233,6 +2234,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

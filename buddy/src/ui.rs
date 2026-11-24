@@ -4,337 +4,74 @@ use crate::{
     model::*,
     options,
     session::{Interface, RunOptions, synchronize},
-    setup::{self, Row, Selection},
+    setup::{self, DeviceState, Row, Selection},
 };
-use anyhow::{Context, Result, anyhow, ensure};
-use eframe::egui::{self, Color32, RichText};
-use serde::{Deserialize, Serialize};
+use anyhow::{Result, anyhow, ensure};
+use eframe::egui::{self, RichText};
 use std::{
-    io::{self, BufRead, Write},
+    collections::BTreeMap,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-        mpsc,
-    },
+    process::Command,
+    sync::mpsc,
     thread,
     time::Duration,
 };
 
+mod dialogs;
+pub(crate) use crate::phase::style;
+pub use dialogs::{Progress, choose, decision_window, progress_window};
+pub(crate) use dialogs::{SaveCopy, choose_conflict};
+
 pub(crate) fn native(size: [f32; 2]) -> eframe::NativeOptions {
     eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size(size),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(size)
+            .with_icon(crate::phase::app_icon()),
         ..Default::default()
     }
 }
-pub(crate) fn style(ctx: &egui::Context) {
-    ctx.all_styles_mut(|s| {
-        s.visuals.override_text_color = Some(if s.visuals.dark_mode {
-            Color32::from_rgb(229, 231, 235)
-        } else {
-            Color32::from_rgb(31, 41, 55)
-        });
-        s.text_styles
-            .insert(egui::TextStyle::Body, egui::FontId::proportional(16.));
-        s.text_styles
-            .insert(egui::TextStyle::Button, egui::FontId::proportional(16.));
-        s.text_styles
-            .insert(egui::TextStyle::Heading, egui::FontId::proportional(24.));
-        s.spacing.button_padding = egui::vec2(12., 7.);
-        s.spacing.item_spacing = egui::vec2(8., 8.);
-        s.spacing.interact_size.y = 32.;
-    });
-}
-#[derive(Serialize, Deserialize)]
-struct Question {
-    title: String,
-    message: String,
-    choices: Vec<String>,
-}
-pub fn choose(title: &str, message: &str, options: &[&str]) -> Result<usize> {
-    let mut child = Command::new(std::env::current_exe()?)
-        .arg("_decision")
-        .stdin(Stdio::piped())
-        .spawn()?;
-    serde_json::to_writer(
-        child.stdin.take().context("open decision window")?,
-        &Question {
-            title: title.into(),
-            message: message.into(),
-            choices: options.iter().map(|s| s.to_string()).collect(),
-        },
-    )?;
-    let code = child.wait()?.code().unwrap_or(1);
-    ensure!(code >= 10 && code < 10 + options.len() as i32, "cancelled");
-    Ok((code - 10) as usize)
-}
-pub fn decision_window() -> Result<i32> {
-    let q: Question = serde_json::from_reader(io::stdin().lock())?;
-    let result = Arc::new(AtomicUsize::new(1));
-    let choice = result.clone();
-    let title = q.title.clone();
-    let mut focus = q
-        .choices
-        .iter()
-        .position(|c| matches!(c.as_str(), "Cancel" | "Decide later" | "Leave pending"))
-        .unwrap_or(0);
-    let mut initial = true;
-    eframe::run_simple_native(&title, native([690., 350.]), move |ctx, _| {
-        if initial {
-            style(ctx);
-            initial = false;
-        }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(12.);
-            ui.heading(&q.title);
-            ui.add_space(12.);
-            egui::ScrollArea::vertical()
-                .max_height((ui.available_height() - 66.).max(80.))
-                .show(ui, |ui| ui.label(&q.message));
-            ui.add_space(18.);
-            if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
-                focus = (focus + q.choices.len() - 1) % q.choices.len();
-            }
-            if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
-                focus = (focus + 1) % q.choices.len();
-            }
-            let activate = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.horizontal_wrapped(|ui| {
-                for (i, opt) in q.choices.iter().enumerate() {
-                    if ui.selectable_label(i == focus, opt).clicked() || activate && i == focus {
-                        choice.store(i + 10, Ordering::Relaxed);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                }
-            });
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        });
-    })
-    .map_err(|e| anyhow!(e.to_string()))?;
-    Ok(result.load(Ordering::Relaxed) as i32)
-}
-pub fn progress_window() -> Result<()> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        for line in io::stdin()
-            .lock()
-            .lines()
-            .map_while(std::result::Result::ok)
-        {
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-        // This is a dedicated progress process. EOF means the wrapper has finished
-        // or exited. A suspended or occluded compositor may never draw another frame.
-        std::process::exit(0);
-    });
-    let mut text = String::from("Checking game files…");
-    eframe::run_simple_native("Buddy sync", native([410., 115.]), move |ctx, _| {
-        loop {
-            match rx.try_recv() {
-                Ok(s) => text = s,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(_) => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    break;
-                }
-            }
-        }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(15.);
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(&text);
-            });
-        });
-        ctx.request_repaint_after(Duration::from_millis(150));
-    })
-    .map_err(|e| anyhow!(e.to_string()))
-}
-// A pipe ties the graphical indicator to this process even when Steam terminates the wrapper.
-pub struct Progress(Option<mpsc::Sender<String>>);
-impl Progress {
-    pub fn start(ui: Interface, message: &str) -> Self {
-        if !matches!(ui, Interface::Window) {
-            return Self(None);
-        }
-        let (tx, rx) = mpsc::channel::<String>();
-        let mut text = message.to_owned();
-        thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(1);
-            loop {
-                match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                {
-                    Ok(next) => text = next,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    Err(mpsc::RecvTimeoutError::Timeout) => break,
-                }
-            }
-            let Ok(binary) = std::env::current_exe() else {
-                return;
-            };
-            let Ok(mut child) = Command::new(binary)
-                .arg("_progress")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            else {
-                return;
-            };
-            if let Some(mut pipe) = child.stdin.take() {
-                let _ = writeln!(pipe, "{text}");
-                for next in rx {
-                    if writeln!(pipe, "{next}").is_err() {
-                        break;
-                    }
-                }
-            }
-            let _ = child.wait();
-        });
-        Self(Some(tx))
-    }
-    pub fn transfer(&self, verb: &str, done: u64, total: u64) {
-        if total > 0 {
-            self.status(&format!(
-                "{verb} {:.1} / {:.1} MiB",
-                done as f64 / 1048576.,
-                total as f64 / 1048576.
-            ));
-        }
-    }
-    pub fn status(&self, text: &str) {
-        if let Some(tx) = &self.0 {
-            let _ = tx.send(text.into());
-        }
-    }
-}
 
-type Suggestions = Vec<(String, Kind, Option<PathBuf>)>;
+use crate::phase;
+mod artwork;
+mod onboarding;
+mod review;
+use onboarding::JoinStep;
+
 struct Detail {
-    cloud_history: bool,
-    candidates: Vec<crate::manifest::Suggestion>,
+    account_scope: String,
     game: String,
-    slots: Suggestions,
-    bindings: Vec<(String, Binding)>,
-    backups: Vec<Backup>,
-    shared: bool,
-    retention: u32,
-    roots: Vec<(String, PathBuf)>,
+    own: Option<Recipe>,
+    shared_options: Vec<(String, Recipe)>,
+    candidates: Vec<crate::manifest::Suggestion>,
+    detected: BTreeMap<PathBuf, Kind>,
+    baseline: setup::ReviewBase,
+    device: DeviceState,
+    has_account_recipe: bool,
+    local_slots: BTreeMap<String, Slot>,
+    bindings: BTreeMap<String, Binding>,
+    named_roots: BTreeMap<String, PathBuf>,
+    roots: BTreeMap<String, PathBuf>,
+    platform: String,
+    cloud_history: bool,
     launcher: Option<Launcher>,
+    backups: Vec<Backup>,
     offline: bool,
     draft: bool,
-    shared_options: Vec<(String, String)>,
+    shared: bool,
+    retention: u32,
 }
-#[derive(Clone, PartialEq)]
-struct PreviewKey {
-    game: String,
-    path: PathBuf,
-    kind: Kind,
-    slot: String,
-}
-
-#[derive(Default)]
-struct SelectionPreview {
-    key: Option<PreviewKey>,
-    since: Option<std::time::Instant>,
-    worker: Option<mpsc::Receiver<Result<crate::files::Preview, String>>>,
-    result: Option<Result<crate::files::Preview, String>>,
-    cancel: Option<mpsc::Sender<()>>,
-}
-
-impl SelectionPreview {
-    fn render(&mut self, ui: &mut egui::Ui, home: &Path, key: PreviewKey) -> Option<&Binding> {
-        if self.key.as_ref() != Some(&key) {
-            *self = Self {
-                key: Some(key.clone()),
-                since: Some(std::time::Instant::now()),
-                ..Self::default()
-            };
-        }
-        if key.path.as_os_str().is_empty() || !crate::model::key(&key.slot) {
-            return None;
-        }
-        if self
-            .since
-            .is_some_and(|start| start.elapsed() >= Duration::from_millis(300))
-        {
-            let (tx, rx) = mpsc::channel();
-            let (alive, cancellation) = mpsc::channel::<()>();
-            let home = home.to_owned();
-            thread::spawn(move || {
-                let res = crate::files::preview(&home, &key.path, key.kind, &key.slot, || {
-                    cancellation.try_recv() == Err(mpsc::TryRecvError::Disconnected)
-                });
-                let _ = tx.send(res.map_err(|e| format!("{e:#}")));
-            });
-            self.cancel = Some(alive);
-            self.worker = Some(rx);
-            self.since = None;
-        }
-        if let Some(rx) = &self.worker {
-            match rx.try_recv() {
-                Ok(result) => {
-                    self.result = Some(result);
-                    self.worker = None;
-                    self.cancel = None;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.result = Some(Err("File preview stopped".into()));
-                    self.worker = None;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
-        match &self.result {
-            Some(Ok(p)) => {
-                let count = p.files.len();
-                let unit = if count == 1 { "file" } else { "files" };
-                let total = if p.bytes < 1024 * 1024 {
-                    format!("{} bytes", p.bytes)
-                } else {
-                    format!("{:.2} MiB ({} bytes)", p.bytes as f64 / 1048576., p.bytes)
-                };
-                ui.label(format!("{count} {unit} · {total}"));
-                if p.files.is_empty() {
-                    ui.small("This selection is currently empty.");
-                } else {
-                    egui::CollapsingHeader::new("Included files")
-                        .id_salt("selected-files")
-                        .show(ui, |ui| {
-                            let height = ui.text_style_height(&egui::TextStyle::Body);
-                            egui::ScrollArea::vertical()
-                                .id_salt("file-list")
-                                .max_height(130.)
-                                .show_rows(ui, height, p.files.len(), |ui, range| {
-                                    for name in &p.files[range] {
-                                        ui.label(name);
-                                    }
-                                });
-                        });
-                }
-                Some(&p.binding)
-            }
-            Some(Err(error)) => {
-                ui.colored_label(ui.visuals().error_fg_color, error);
-                None
-            }
-            None => {
-                ui.label("Counting files…");
-                ui.ctx().request_repaint_after(Duration::from_millis(100));
-                None
-            }
-        }
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GamePage {
+    Overview,
+    Files,
+    Backups,
+    Settings,
 }
 enum Event {
     Signed(Vec<Row>),
     Catalog(String),
     Bound,
+    ReviewStaged(String),
     Games(Vec<Row>),
     Detail(Box<Detail>),
     Done(String),
@@ -346,6 +83,7 @@ struct App {
     tx: mpsc::Sender<Reply>,
     busy: bool,
     signed: bool,
+    join_step: JoinStep,
     url: String,
     account: String,
     password: String,
@@ -356,22 +94,108 @@ struct App {
     private_file: bool,
     games: Vec<Row>,
     filter: String,
-    server_only: bool,
+    library_filter: LibraryFilter,
+    artwork: artwork::Artwork,
     selected: String,
     title: String,
-    slot: String,
-    path: String,
-    preview: SelectionPreview,
-    file: bool,
-    settings: bool,
-    source: Option<String>,
-    root_name: String,
+    page: GamePage,
+    review: Option<review::Review>,
     launcher: Launcher,
     launcher_args: String,
     detail: Option<Detail>,
     note: String,
     error: bool,
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum LibraryFilter {
+    All,
+    Configured,
+    Server,
+}
+impl LibraryFilter {
+    fn matches(self, row: &Row) -> bool {
+        match self {
+            Self::All => true,
+            Self::Configured => row.device == DeviceState::Ready,
+            Self::Server => row.mine || row.shared,
+        }
+    }
+}
+
+fn phase_heading(ui: &mut egui::Ui, title: &str) {
+    ui.heading(
+        egui::RichText::new(title)
+            .size(34.)
+            .strong()
+            .color(phase::TEXT),
+    );
+}
+
+fn cover_title(ui: &egui::Ui, rect: egui::Rect, title: &str, y: f32, size: f32) {
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        title.to_owned(),
+        egui::FontId::proportional(size),
+        phase::TEXT,
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width((rect.width() - 36.).max(1.));
+    let text = ui.painter().layout_job(job);
+    ui.painter().galley(
+        egui::pos2(rect.left() + 18., y - text.size().y),
+        text,
+        phase::TEXT,
+    );
+}
+
+fn game_tile(
+    ui: &mut egui::Ui,
+    art: &mut artwork::Artwork,
+    row: &Row,
+    size: egui::Vec2,
+) -> egui::Response {
+    let label = match row.device {
+        DeviceState::Ready => "Configured",
+        DeviceState::Paused => "Paused here",
+        DeviceState::Pending => "Setup pending",
+        DeviceState::NeedsLocations => "Choose locations",
+        DeviceState::New if row.mine => "My recipe",
+        DeviceState::New if row.shared => "Shared recipe",
+        DeviceState::New => "Installed",
+    };
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            format!("{} · {label}", row.title),
+        )
+    });
+    if ui.is_rect_visible(rect) {
+        art.paint(ui, rect, &row.id);
+        let stroke = if response.hovered() || response.has_focus() {
+            phase::ORANGE
+        } else {
+            phase::LINE
+        };
+        ui.painter().rect_stroke(
+            rect,
+            3.,
+            egui::Stroke::new(1.0_f32, stroke),
+            egui::StrokeKind::Inside,
+        );
+        cover_title(ui, rect, &row.title, rect.bottom() - 37., 25.);
+        let pos = egui::pos2(rect.left() + 20., rect.bottom() - 21.);
+        ui.painter().circle_filled(pos, 2.6, phase::ORANGE);
+        ui.painter().text(
+            pos + egui::vec2(9., 0.),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(13.),
+            phase::TEXT,
+        );
+    }
+    response.on_hover_text(&row.title)
+}
+
 impl App {
     fn new(local: Local) -> Self {
         let (tx, rx) = mpsc::channel();
@@ -384,6 +208,7 @@ impl App {
             rx,
             busy: false,
             signed,
+            join_step: JoinStep::Welcome,
             url: c
                 .as_ref()
                 .map(|c| c.url.clone())
@@ -397,16 +222,12 @@ impl App {
             private_file: false,
             games: vec![],
             filter: String::new(),
-            server_only: false,
+            library_filter: LibraryFilter::All,
+            artwork: artwork::Artwork::new(),
             selected: String::new(),
             title: String::new(),
-            slot: "saves".into(),
-            path: String::new(),
-            preview: SelectionPreview::default(),
-            file: false,
-            settings: false,
-            source: None,
-            root_name: String::new(),
+            page: GamePage::Overview,
+            review: None,
             launcher: Launcher::default(),
             launcher_args: String::new(),
             detail: None,
@@ -436,207 +257,173 @@ impl App {
     }
     fn load(&mut self) {
         let game = self.selected.clone();
-        let show_shared = self
-            .games
-            .iter()
-            .any(|g| g.id == game && g.shared && !g.mine && !g.local);
         self.job(move |l| {
             let c = l.credentials()?;
-            let s = l.setups(&c)?.into_iter().find(|s| s.recipe.game == game);
-            let slots = setup::suggest(&l, &game)?;
-            let (backups, offline) = if s.is_some() {
-                match Api::new(c.clone())?.rpc(Action::Backups { game: game.clone() }) {
-                    Ok(rows) => (rows, false),
+            let s = l.maybe_setup(&c, &game)?;
+            let api = Api::new(c.clone())?;
+            let (remote, offline) = match api.rpc::<Vec<GameInfo>>(Action::Games) {
+                Ok(rows) => (rows.into_iter().find(|r| r.recipe.game == game), false),
+                Err(e) if crate::local::unreachable(&e) => (None, true),
+                Err(e) => return Err(e),
+            };
+            let has_account_recipe =
+                remote.is_some() || (offline && s.as_ref().is_some_and(|s| s.revision > 0));
+            let own_revision = (!offline).then(|| remote.as_ref().map_or(0, |g| g.revision));
+            let shared = remote
+                .as_ref()
+                .map_or_else(|| s.as_ref().is_some_and(|s| s.shared), |r| r.shared);
+            let own = remote.map(|g| g.recipe).or_else(|| {
+                s.as_ref()
+                    .filter(|s| !s.recipe.slots.is_empty())
+                    .map(|s| s.recipe.clone())
+            });
+            let retention = own.as_ref().map_or(3, |r| r.retention);
+            let shared_options = if own.is_none() && !offline {
+                api.rpc::<Vec<GameInfo>>(Action::Catalog)?
+                    .into_iter()
+                    .filter(|info| info.recipe.game == game)
+                    .map(|info| Ok((setup::recipe_hash(&info.recipe)?, info.recipe)))
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                vec![]
+            };
+            let named_roots = l.named_roots(&c, &game)?;
+            let baseline =
+                setup::ReviewBase::new(&l, &c, &game, s.as_ref(), &named_roots, own_revision)?;
+            let mut available = roots(&game);
+            available.extend(named_roots.clone());
+            let (backups, offline) = if has_account_recipe && s.is_some() && !offline {
+                match api.rpc(Action::Backups { game: game.clone() }) {
+                    Ok(list) => (list, false),
                     Err(e) if crate::local::unreachable(&e) => (vec![], true),
                     Err(e) => return Err(e),
                 }
             } else {
-                (vec![], false)
+                (vec![], offline)
             };
-            let mut available = roots(&game);
-            available.extend(l.named_roots(&c, &game)?);
-            let mut shared_options = vec![];
-            if show_shared {
-                let catalog: Vec<GameInfo> = Api::new(c.clone())?.rpc(Action::Catalog)?;
-                for i in catalog.into_iter().filter(|i| i.recipe.game == game) {
-                    let hash = setup::recipe_hash(&i.recipe)?;
-                    let names = i
-                        .recipe
-                        .slots
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    shared_options.push((
-                        format!("{} · {} · {}", i.recipe.title, names, &hash[..8]),
-                        hash,
-                    ));
-                }
-            }
-            let d = Detail {
-                cloud_history: crate::local::has_cloud_history(&game),
-                shared_options,
-                candidates: crate::manifest::candidates(&l, &game)?,
-                roots: available.into_iter().collect(),
-                launcher: l.launcher(&c, &game)?,
-                offline,
-                draft: s.as_ref().is_some_and(|s| s.draft.is_some()),
-                game,
-                slots,
-                backups,
-                shared: s.as_ref().is_some_and(|s| s.shared),
-                retention: s.as_ref().map_or(3, |s| s.recipe.retention),
-                bindings: s
-                    .map(|s| s.bindings.into_iter().collect())
+            let mut detail = Detail {
+                account_scope: l.scope(&c),
+                detected: BTreeMap::new(),
+                baseline,
+                device: DeviceState::from_setup(s.as_ref()),
+                has_account_recipe,
+                platform: setup::runtime(&game),
+                local_slots: s
+                    .as_ref()
+                    .map(|s| s.recipe.slots.clone())
                     .unwrap_or_default(),
+                bindings: s.as_ref().map(|s| s.bindings.clone()).unwrap_or_default(),
+                draft: s.as_ref().is_some_and(|s| s.draft.is_some()),
+                shared,
+                retention,
+                cloud_history: crate::local::has_cloud_history(&game),
+                candidates: crate::manifest::candidates(&l, &game)?,
+                launcher: l.launcher(&c, &game)?,
+                roots: available,
+                named_roots,
+                game,
+                own,
+                shared_options,
+                backups,
+                offline,
             };
-            Ok(Event::Detail(Box::new(d)))
+            detail.detected = review::detected_locations(&detail)?;
+            Ok(Event::Detail(Box::new(detail)))
         });
+    }
+    fn leave_game(&mut self) {
+        self.selected.clear();
+        self.title.clear();
+        self.review = None;
+        self.detail = None;
+        self.note.clear();
+        self.page = GamePage::Overview;
     }
     fn select(&mut self, game: String, title: String) {
+        self.leave_game();
         self.selected = game;
         self.title = title;
-        self.path.clear();
-        self.preview = SelectionPreview::default();
-        self.source = None;
-        self.slot = "saves".into();
-        self.detail = None;
         self.load();
     }
-    fn login(&mut self, ui: &mut egui::Ui) {
-        ui.set_max_width(470.);
-        ui.heading("Connect to Buddy");
-        ui.add_space(12.);
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Open server pairing file…").clicked()
-                && let Some(file) = rfd::FileDialog::new()
-                    .add_filter("Buddy pairing", &["json"])
-                    .pick_file()
-            {
-                self.import_pairing(&file);
-            }
-            let own = crate::host::pair_path(&self.local);
-            if own.is_file() && ui.button("Use my hosted server").clicked() {
-                self.import_pairing(&own);
-            }
-        });
-        if let Some(pair) = &self.pairing {
-            ui.label(&pair.url);
-            ui.monospace(format!("Paired host · {}", pair.fingerprint()));
-            if ui.small_button("Use another server").clicked() {
-                self.pairing = None;
-                self.url.clear();
-            }
-        } else {
-            field(ui, "Server URL", &mut self.url);
-        }
-        field(ui, "Account", &mut self.account);
-        ui.label("Password");
-        ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
-        field(ui, "Device name", &mut self.device);
-        ui.checkbox(&mut self.register, "Create account with an invite");
-        if self.register {
-            field(ui, "Invite", &mut self.invite);
-        }
-        ui.collapsing("Credential storage", |ui| {
-            ui.checkbox(
-                &mut self.private_file,
-                "Store token in private app data on this device",
-            );
-        });
-        ui.add_space(10.);
-        if ui.button("Sign in and remember this device").clicked() {
-            let url = self.url.clone();
-            let login = Login {
-                account: self.account.clone(),
-                password: std::mem::take(&mut self.password),
-                device: self.device.clone(),
-                invite: self.register.then(|| std::mem::take(&mut self.invite)),
-            };
-            let private_file = self.private_file;
-            let pairing = self.pairing.clone();
-            self.job(move |l| {
-                l.set_login(
-                    &Api::login_paired(&url, login, pairing.as_ref())?,
-                    private_file,
-                )?;
-                Ok(Event::Signed(setup::games(&l)?))
-            });
-        }
-    }
     fn finished(&mut self, s: String) {
-        if let Some(r) = self.games.iter_mut().find(|r| r.id == self.selected) {
-            r.local = true;
-            r.mine = true;
-        } else {
-            self.games.push(Row {
-                id: self.selected.clone(),
-                title: self.title.clone(),
-                local: true,
-                mine: true,
-                installed: false,
-                shared: false,
-            });
-        }
         self.load();
         self.note = s;
     }
-    fn import_pairing(&mut self, path: &Path) {
-        match crate::host::Pairing::load(path) {
-            Ok(pair) => {
-                self.url = pair.url.clone();
-                self.pairing = Some(pair);
-                self.error = false;
-                self.note.clear();
-            }
-            Err(e) => {
-                self.error = true;
-                self.note = format!("{e:#}");
-            }
-        }
-    }
     fn library(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Games");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.filter)
-                .hint_text("Search installed and configured games"),
-        );
-        ui.checkbox(&mut self.server_only, "Server recipes only");
-        let mut selection = None;
-        egui::ScrollArea::vertical()
-            .id_salt("games")
-            .max_height((ui.available_height() - 55.).max(80.))
-            .show(ui, |ui| {
-                for r in &self.games {
-                    if self.server_only && !r.shared && !r.mine
-                        || !format!("{} {}", r.title, r.id)
-                            .to_lowercase()
-                            .contains(&self.filter.to_lowercase())
-                    {
-                        continue;
-                    }
-                    let label = if r.local {
-                        "Configured"
-                    } else if r.mine {
-                        "My recipe"
-                    } else if r.shared {
-                        "Shared recipe"
-                    } else {
-                        "Installed"
-                    };
-                    if ui
-                        .selectable_label(self.selected == r.id, format!("{}\n{}", r.title, label))
-                        .clicked()
-                    {
-                        selection = Some((r.id.clone(), r.title.clone()));
-                    }
+        ui.horizontal_wrapped(|ui| {
+            phase_heading(ui, "Game library");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("+ Non-Steam game").clicked() {
+                    self.select(format!("custom-{}", id()), String::new());
                 }
             });
-        if let Some((id, title)) = selection {
-            self.select(id, title);
+        });
+        ui.add_space(6.);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.filter)
+                .hint_text("Find a game")
+                .desired_width(285.),
+        );
+        ui.horizontal_wrapped(|ui| {
+            for (filter, label) in [
+                (LibraryFilter::All, "All games"),
+                (LibraryFilter::Configured, "Configured"),
+                (LibraryFilter::Server, "Server recipes"),
+            ] {
+                let count = self.games.iter().filter(|row| filter.matches(row)).count();
+                ui.selectable_value(
+                    &mut self.library_filter,
+                    filter,
+                    format!("{label}  {count}"),
+                );
+            }
+        });
+        ui.separator();
+        let query = self.filter.trim().to_lowercase();
+        let matches: Vec<_> = self
+            .games
+            .iter()
+            .filter(|r| {
+                self.library_filter.matches(r)
+                    && (query.is_empty()
+                        || r.title.to_lowercase().contains(&query)
+                        || r.id.to_lowercase().contains(&query))
+            })
+            .collect();
+        if matches.is_empty() {
+            if !self.busy {
+                ui.weak(if self.games.is_empty() {
+                    "No games found"
+                } else {
+                    "No matching games"
+                });
+            }
+            return;
         }
-        if ui.button("Add non-Steam game").clicked() {
-            self.select(format!("custom-{}", id()), String::new());
+        let columns = if ui.available_width() >= 620. { 2 } else { 1 };
+        let height = if columns == 1 { 116. } else { 138. };
+        let mut picked = None;
+        egui::ScrollArea::vertical()
+            .id_salt(("game-cards", &self.filter, self.library_filter))
+            .show_rows(ui, height, matches.len().div_ceil(columns), |ui, range| {
+                let width = (ui.available_width()
+                    - ui.spacing().item_spacing.x * (columns - 1) as f32)
+                    / columns as f32;
+                for idx in range {
+                    let start = idx * columns;
+                    ui.horizontal(|ui| {
+                        for row in &matches[start..(start + columns).min(matches.len())] {
+                            let response =
+                                game_tile(ui, &mut self.artwork, row, egui::vec2(width, height));
+                            if response.clicked() {
+                                picked = Some((row.id.clone(), row.title.clone()));
+                            }
+                        }
+                    });
+                }
+            });
+        if let Some((id, title)) = picked {
+            self.select(id, title);
         }
     }
     fn launch_fields(&mut self, ui: &mut egui::Ui, game: &str) {
@@ -672,195 +459,119 @@ impl App {
         }
     }
     fn game(&mut self, ui: &mut egui::Ui) {
-        if self.selected.is_empty() {
-            ui.heading("Select a game");
+        if ui.button("Back to library").clicked() {
+            self.leave_game();
             return;
         }
         let game = self.selected.clone();
-        ui.heading(if self.title.is_empty() {
-            "New game"
-        } else {
-            &self.title
-        });
-        ui.small(&game);
-        if self.title.is_empty() || self.selected.starts_with("custom-") {
-            field(ui, "Game title", &mut self.title);
-        }
-        let mut unbind = None;
-        let mut import = None;
-        if let Some(d) = &self.detail {
-            ui.add_space(8.);
-            if d.offline {
-                ui.label("Offline · showing the setup saved on this device");
-            }
-            for (label, hash) in &d.shared_options {
-                if ui.button(format!("Use shared recipe   {label}")).clicked() {
-                    import = Some(hash.clone());
-                }
-            }
-            for candidate in &d.candidates {
-                let label = format!(
-                    "{}    {}",
-                    if candidate.settings {
-                        "Settings"
-                    } else {
-                        "Save"
-                    },
-                    candidate.path.display()
-                );
-                if ui
-                    .selectable_label(self.path == candidate.path.display().to_string(), label)
-                    .on_hover_text(&candidate.source)
-                    .clicked()
-                {
-                    if let Some(slot) = candidate.slot {
-                        self.slot = slot.to_owned();
-                    }
-                    self.path = candidate.path.display().to_string();
-                    self.file = candidate.kind == Kind::File;
-                    self.settings = candidate.settings;
-                    self.source = Some(candidate.source.clone());
-                }
-            }
-            for (k, b) in &d.bindings {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("{k}    {}", b.path.display()));
-                    if ui.small_button("Stop syncing here…").clicked() {
-                        unbind = Some(k.clone());
-                    }
-                });
-            }
-            for (name, kind, hint) in &d.slots {
-                if ui.button(format!("Configure {name}")).clicked() {
-                    self.slot = name.clone();
-                    self.file = *kind == Kind::File;
-                    self.source = None;
-                    self.path = d
-                        .bindings
-                        .iter()
-                        .find(|(k, _)| k == name)
-                        .map(|(_, b)| &b.path)
-                        .or(hint.as_ref())
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default();
-                }
-            }
-        }
-        if let Some(hash) = import {
-            let g = game.clone();
-            self.job(move |l| {
-                setup::import(&l, &g, &hash)?;
-                Ok(Event::Done("Recipe copied to your account".into()))
-            });
-        }
-        if let Some(slot) = unbind {
-            let selected = game.clone();
-            self.job(move |l| {
-                ensure!(
-                    choose(
-                        "Stop syncing this selection",
-                        &format!("Leave {slot} on disk and keep its server history?"),
-                        &["Cancel", "Stop syncing here"]
-                    )? == 1,
-                    "cancelled"
-                );
-                setup::unbind(&l, &selected, &slot)?;
-                Ok(Event::Done("Selection removed from this device".into()))
-            });
-        }
-        ui.separator();
-        ui.label("Files to sync");
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.file, false, "Folder");
-            ui.selectable_value(&mut self.file, true, "Single file");
-            ui.checkbox(&mut self.settings, "Game settings");
-        });
-        ui.horizontal(|ui| {
-            if ui.text_edit_singleline(&mut self.path).changed() {
-                self.source = None;
-            }
-            if ui.button("Browse…").clicked() {
-                self.browse(None);
-            }
-        });
-        let shortcuts = self
-            .detail
-            .as_ref()
-            .map(|d| d.roots.clone())
-            .unwrap_or_default();
-        ui.horizontal_wrapped(|ui| {
-            for (k, p) in shortcuts {
-                if !["data", "config", "documents"].contains(&k.as_str())
-                    && ui.small_button(k).clicked()
-                {
-                    self.browse(Some(&p));
-                }
-            }
-        });
-        field(ui, "Selection name", &mut self.slot);
-        if let Some(source) = &self.source {
-            ui.label(source);
-        }
-        if game.starts_with("steam-") && !self.path.is_empty() {
-            if self.detail.as_ref().is_some_and(|d| d.cloud_history) {
-                ui.label("Steam has Cloud records for this game. If both services sync these files, disable Steam Cloud for the game on each device in Steam Properties, under General.");
-            } else {
-                ui.collapsing("Steam Cloud overlap", |ui| {
-                    ui.label("If this game uses Steam Cloud for these files, choose one sync service per file. You can disable Cloud for the game in Steam Properties, under General.");
-                });
-            }
-        }
-        let reviewed = self.preview.render(
-            ui,
-            &self.local.home,
-            PreviewKey {
-                game: game.clone(),
-                path: PathBuf::from(&self.path),
-                kind: if self.file { Kind::File } else { Kind::Folder },
-                slot: self.slot.clone(),
-            },
+        let (banner, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 81.), egui::Sense::hover());
+        self.artwork.paint(ui, banner, &game);
+        ui.painter().rect_stroke(
+            banner,
+            3.,
+            egui::Stroke::new(1.0_f32, phase::LINE),
+            egui::StrokeKind::Inside,
         );
-
-        if ui
-            .add_enabled(
-                reviewed.is_some() && !self.title.trim().is_empty(),
-                egui::Button::new("Save selection"),
-            )
-            .clicked()
-            && let Some(binding) = reviewed.cloned()
-        {
-            let sel = Selection {
-                game: game.clone(),
-                title: self.title.clone(),
-                slot: self.slot.clone(),
-                path: PathBuf::from(&self.path),
-                kind: if self.file { Kind::File } else { Kind::Folder },
-                settings: self.settings,
-                source: self.source.clone(),
-            };
-            self.job(move |l| {
-                setup::bind(&l, sel, Some(&binding))?;
-                Ok(Event::Bound)
+        cover_title(
+            ui,
+            banner,
+            if self.title.is_empty() {
+                "New game"
+            } else {
+                &self.title
+            },
+            banner.bottom() - 15.,
+            32.,
+        );
+        let Some(d) = &self.detail else {
+            if !self.busy && ui.button("Retry").clicked() {
+                self.load();
+            }
+            return;
+        };
+        if d.offline {
+            ui.weak(if !d.device.needs_locations() {
+                "Offline · saved on this device"
+            } else {
+                "Connect to the server to set up this game"
             });
         }
-        ui.collapsing("Custom root directories", |ui| {
-            field(ui, "Name used in the recipe", &mut self.root_name);
-            if ui
-                .add_enabled(
-                    key(&self.root_name),
-                    egui::Button::new("Choose directory on this device…"),
-                )
-                .clicked()
-                && let Some(path) = rfd::FileDialog::new().pick_folder()
-            {
-                let (g, name) = (game.clone(), self.root_name.clone());
-                self.job(move |l| {
-                    l.bind_root(&g, &name, &path)?;
-                    Ok(Event::Done(format!("Directory saved for {name}")))
+        if !d.device.needs_locations() {
+            ui.horizontal_wrapped(|ui| {
+                for (page, name) in [
+                    (GamePage::Overview, "Overview"),
+                    (GamePage::Files, "Edit files"),
+                    (GamePage::Backups, "Backups"),
+                    (GamePage::Settings, "Settings"),
+                ] {
+                    if ui.selectable_label(self.page == page, name).clicked() && self.page != page {
+                        self.page = page;
+                        self.review = None;
+                    }
+                }
+            });
+            ui.separator();
+        }
+        if self.page == GamePage::Files && !d.draft {
+            if d.device.needs_locations() && game.starts_with("custom-") && d.own.is_none() {
+                field(ui, "Game title", &mut self.title);
+            }
+            ui.heading("Files to sync");
+            let review = self.review.get_or_insert_with(|| {
+                let shared = if d.shared_options.len() == 1 {
+                    Some(d.shared_options[0].0.clone())
+                } else {
+                    None
+                };
+                review::Review::new(d, shared)
+            });
+            #[cfg(target_os = "linux")]
+            let new_proton_game = d.device.needs_locations() && game.starts_with("steam-");
+            if let Some(changes) = review.show(ui, d, &self.title, &self.local.home) {
+                let base = d.baseline.clone();
+                let stopping_all = !d.bindings.is_empty()
+                    && changes.approved.is_empty()
+                    && changes.removed.len() == d.bindings.len();
+                let game = game.clone();
+                let scope = d.account_scope.clone();
+                self.job(move |local| {
+                    if !changes.removed.is_empty() {
+                        let title = if stopping_all {
+                            "Stop syncing this game"
+                        } else {
+                            "Remove selected locations"
+                        };
+                        let removed = changes.removed.join(", ");
+                        let message = format!(
+                            "Stop syncing {removed} on this device? Local files and server history will be kept."
+                        );
+                        ensure!(
+                            choose(title, &message, &["Cancel", "Save setup"])? == 1,
+                            "cancelled"
+                        );
+                    }
+                    if let Err(error) = setup::save_review(&local, &base, changes) {
+                        let credentials = local.credentials()?;
+                        if local.scope(&credentials) == scope
+                            && local.maybe_setup(&credentials, &game)?.is_some_and(|s| s.draft.is_some())
+                        {
+                            return Ok(Event::ReviewStaged(format!("{error:#}")));
+                        }
+                        return Err(error);
+                    }
+                    Ok(Event::Bound)
                 });
             }
-        });
-        let configured = self.detail.as_ref().is_some_and(|d| !d.bindings.is_empty());
+            #[cfg(target_os = "linux")]
+            if new_proton_game {
+                ui.collapsing("First Play with Proton", |ui| {
+                    ui.label("Copy the launch options and press Play in Steam to initialize a new prefix.");
+                    self.launch_fields(ui, &game);
+                });
+            }
+            return;
+        }
         if self.detail.as_ref().is_some_and(|d| d.draft) {
             ui.label("Recipe edits queued on this device");
             ui.horizontal(|ui| {
@@ -888,51 +599,124 @@ impl App {
                 }
             });
         }
-        if !configured {
-            #[cfg(target_os = "linux")]
-            if game.starts_with("steam-") {
-                ui.small("For a new Proton installation, copy the launch options and press Play in Steam to initialize its prefix.");
-                self.launch_fields(ui, &game);
-            }
-            return;
+        match self.page {
+            GamePage::Files => {}
+            GamePage::Backups => self.backups(ui, &game),
+            GamePage::Settings => self.game_settings(ui, &game),
+            GamePage::Overview => self.overview(ui, &game),
         }
-        ui.add_space(8.);
-        ui.horizontal_wrapped(|ui| {
-            if let Some(launch) = self.detail.as_ref().and_then(|d| d.launcher.clone())
-                && ui.button("Play").clicked()
-            {
-                let selected = game.clone();
-                self.job(move |local| {
-                    let mut cmd = Command::new(std::env::current_exe()?);
-                    cmd.env("BUDDY_HOME", &local.home);
-                    cmd.args(["run", "--game", &selected]);
-                    if launch.manual_exit {
-                        cmd.arg("--manual-exit");
-                    }
-                    let status = cmd
-                        .arg("--")
-                        .arg(launch.executable)
-                        .args(launch.args)
-                        .current_dir(launch.directory)
-                        .status()?;
-                    Ok(Event::Done(format!("Game closed ({status})")))
+    }
+    fn overview(&mut self, ui: &mut egui::Ui, game: &str) {
+        let Some(d) = &self.detail else { return };
+        phase::panel().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(RichText::new("Synced locations").strong().size(19.));
+            ui.separator();
+            if d.bindings.is_empty() {
+                ui.weak("No locations enabled on this device");
+            }
+            for (name, b) in &d.bindings {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(name);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(b.path.display().to_string())
+                                .monospace()
+                                .size(13.)
+                                .color(phase::MUTED),
+                        )
+                        .wrap(),
+                    );
                 });
             }
-            if ui.button("Sync now").clicked() {
-                self.sync(None, false);
-            }
-            if ui.button("Back up now").clicked() {
+        });
+        if let Some(current) = d.backups.iter().find(|b| b.head) {
+            ui.label(
+                RichText::new(format!(
+                    "Current save  ·  {}  ·  {}",
+                    current.origin,
+                    when(current.time)
+                ))
+                .monospace()
+                .size(13.)
+                .color(phase::MUTED),
+            );
+        }
+        let enabled = !d.bindings.is_empty();
+        ui.add_space(4.);
+        if ui
+            .add_enabled(enabled, phase::primary("Sync now"))
+            .clicked()
+        {
+            self.sync(None, false);
+        }
+        if let Some(launch) = self.detail.as_ref().and_then(|d| d.launcher.clone())
+            && ui.button("Play").clicked()
+        {
+            let selected = game.to_owned();
+            self.job(move |local| {
+                let mut cmd = Command::new(std::env::current_exe()?);
+                cmd.env("BUDDY_HOME", &local.home);
+                cmd.args(["run", "--game", &selected]);
+                if launch.manual_exit {
+                    cmd.arg("--manual-exit");
+                }
+                let status = cmd
+                    .arg("--")
+                    .arg(launch.executable)
+                    .args(launch.args)
+                    .current_dir(launch.directory)
+                    .status()?;
+                Ok(Event::Done(format!("Game closed ({status})")))
+            });
+        }
+        self.launch_fields(ui, game);
+    }
+    fn backups(&mut self, ui: &mut egui::Ui, game: &str) {
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("Backups");
+            if ui
+                .add_enabled(
+                    self.detail
+                        .as_ref()
+                        .is_some_and(|d| !d.offline && !d.bindings.is_empty()),
+                    phase::primary("Back up now"),
+                )
+                .clicked()
+            {
                 self.sync(None, true);
             }
         });
-        self.launch_fields(ui, &game);
-        egui::CollapsingHeader::new("Backups").show(ui, |ui| {
-            let list = self
-                .detail
-                .as_ref()
-                .map(|d| d.backups.clone())
-                .unwrap_or_default();
-            for b in list {
+        if self.detail.as_ref().is_some_and(|d| d.offline) {
+            ui.weak("Connect to view backups");
+            return;
+        }
+        let list = self
+            .detail
+            .as_ref()
+            .map(|d| d.backups.clone())
+            .unwrap_or_default();
+        if list.is_empty() {
+            ui.weak("No backups yet");
+        }
+        for (group, title) in [(0, "Current"), (1, "Rolling"), (2, "Permanent")] {
+            let mut rows = list
+                .iter()
+                .filter(|b| {
+                    if b.head {
+                        group == 0
+                    } else if b.reason.is_empty() {
+                        group == 1
+                    } else {
+                        group == 2
+                    }
+                })
+                .peekable();
+            if rows.peek().is_none() {
+                continue;
+            }
+            ui.strong(title);
+            for b in rows {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!(
                         "#{} · {} · {} {} {}",
@@ -947,111 +731,92 @@ impl App {
                     }
                     if b.reason.is_empty() && ui.small_button("Keep").clicked() {
                         self.backup_action(Action::Pin {
-                            game: game.clone(),
+                            game: game.to_owned(),
                             id: b.id,
                         });
                     }
                     if !b.head && ui.small_button("Delete…").clicked() {
                         self.backup_action(Action::Delete {
-                            game: game.clone(),
+                            game: game.to_owned(),
                             id: b.id,
                         });
                     }
                     if b.head && !b.reason.is_empty() && ui.small_button("Remove pin…").clicked()
                     {
                         self.backup_action(Action::UnpinCurrent {
-                            game: game.clone(),
+                            game: game.to_owned(),
                             id: b.id,
                         });
                     }
                 });
             }
-        });
-        ui.collapsing("Advanced", |ui| {
-            ui.collapsing("Launch a game directly", |ui| {
-                if ui.button("Choose executable…").clicked()
-                    && let Some(path) = rfd::FileDialog::new().pick_file()
-                {
-                    self.launcher.directory = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-                    self.launcher.executable = path;
-                }
-                ui.label(self.launcher.executable.display().to_string());
-                if ui.button("Working directory…").clicked()
-                    && let Some(path) = rfd::FileDialog::new().pick_folder()
-                {
-                    self.launcher.directory = path;
-                }
-                ui.label(self.launcher.directory.display().to_string());
-                ui.label("Arguments, one per line");
-                ui.text_edit_multiline(&mut self.launcher_args);
-                ui.checkbox(
-                    &mut self.launcher.manual_exit,
-                    "Ask me when the game has closed",
-                );
-                if ui
-                    .add_enabled(
-                        !self.launcher.executable.as_os_str().is_empty(),
-                        egui::Button::new("Save launcher"),
-                    )
-                    .clicked()
-                {
-                    let (g, mut command) = (game.clone(), self.launcher.clone());
-                    command.args = self.launcher_args.lines().map(str::to_owned).collect();
-                    self.job(move |l| {
-                        l.save_launcher(&g, command)?;
-                        Ok(Event::Done("Local launcher saved".into()))
-                    });
-                }
-            });
-            if let Some(d) = &mut self.detail {
-                ui.checkbox(&mut d.shared, "Publish this file recipe to other accounts");
-                ui.horizontal(|ui| {
-                    ui.label("Previous versions to keep");
-                    ui.add(egui::DragValue::new(&mut d.retention).range(0..=1000));
+        }
+    }
+    fn game_settings(&mut self, ui: &mut egui::Ui, game: &str) {
+        ui.heading("Game settings");
+        ui.collapsing("Launch a game directly", |ui| {
+            if ui.button("Choose executable…").clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_file()
+            {
+                self.launcher.directory = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+                self.launcher.executable = path;
+            }
+            ui.label(self.launcher.executable.display().to_string());
+            if ui.button("Working directory…").clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            {
+                self.launcher.directory = path;
+            }
+            ui.label(self.launcher.directory.display().to_string());
+            ui.label("Arguments, one per line");
+            ui.text_edit_multiline(&mut self.launcher_args);
+            ui.checkbox(
+                &mut self.launcher.manual_exit,
+                "Ask me when the game has closed",
+            );
+            if ui
+                .add_enabled(
+                    !self.launcher.executable.as_os_str().is_empty(),
+                    egui::Button::new("Save launcher"),
+                )
+                .clicked()
+            {
+                let (g, mut command) = (game.to_owned(), self.launcher.clone());
+                command.args = self.launcher_args.lines().map(str::to_owned).collect();
+                self.job(move |l| {
+                    l.save_launcher(&g, command)?;
+                    Ok(Event::Done("Local launcher saved".into()))
                 });
-                let (r, s) = (d.retention, d.shared);
-                if ui.button("Save policy").clicked() {
-                    self.job(move |l| {
-                        setup::policy(&l, &game, Some(r), Some(s))?;
-                        Ok(Event::Done("Policy saved".into()))
-                    });
-                }
             }
         });
-    }
-    fn browse(&mut self, dir: Option<&Path>) {
-        let mut dialog = rfd::FileDialog::new();
-        if let Some(p) = dir {
-            dialog = dialog.set_directory(p);
-        }
-        if let Some(p) = if self.file {
-            dialog.pick_file()
-        } else {
-            dialog.pick_folder()
-        } {
-            self.path = p.display().to_string();
-            self.source = None;
+        if let Some(d) = &mut self.detail {
+            ui.checkbox(&mut d.shared, "Publish this file recipe to other accounts");
+            ui.horizontal(|ui| {
+                ui.label("Previous versions to keep");
+                ui.add(egui::DragValue::new(&mut d.retention).range(0..=1000));
+            });
+            let (r, s) = (d.retention, d.shared);
+            if ui.button("Save policy").clicked() {
+                let game = game.to_owned();
+                self.job(move |l| {
+                    setup::policy(&l, &game, Some(r), Some(s))?;
+                    Ok(Event::Done("Policy saved".into()))
+                });
+            }
         }
     }
     fn sync(&mut self, restore: Option<i64>, pin: bool) {
-        let game = self.selected.clone();
+        let Some(detail) = &self.detail else { return };
+        let game = detail.game.clone();
+        let expected_scope = Some(detail.account_scope.clone());
         self.job(move |l| {
-            if let Some(id) = restore {
-                ensure!(
-                    choose(
-                        "Restore backup",
-                        &format!("Restore backup #{id} to this device and the server?"),
-                        &["Cancel", "Restore"]
-                    )? == 1,
-                    "cancelled"
-                );
-            }
             synchronize(
                 &l,
                 &game,
                 RunOptions {
                     restore,
                     pin,
+                    expected_scope,
                     ..options()
                 },
                 Interface::Window,
@@ -1060,9 +825,23 @@ impl App {
         });
     }
     fn backup_action(&mut self, a: Action) {
+        let Some(scope) = self.detail.as_ref().map(|d| d.account_scope.clone()) else {
+            return;
+        };
         self.job(move |l| {
-            if let Action::UnpinCurrent { id,.. } = &a {
-                ensure!(choose("Remove permanent pin",&format!("Keep #{id} as the current save and apply normal retention to it once replaced?"),&["Cancel","Remove pin"])? == 1,"cancelled");
+            let credentials = l.credentials()?;
+            ensure!(
+                l.scope(&credentials) == scope,
+                "account changed; reopen the game"
+            );
+            if let Action::UnpinCurrent { id, .. } = &a {
+                let message = format!(
+                    "Keep #{id} as the current save and apply normal retention once it is replaced?"
+                );
+                ensure!(
+                    choose("Remove permanent pin", &message, &["Cancel", "Remove pin"])? == 1,
+                    "cancelled"
+                );
             }
             if let Action::Delete { id, .. } = &a {
                 ensure!(
@@ -1074,7 +853,7 @@ impl App {
                     "cancelled"
                 );
             }
-            Api::new(l.credentials()?)?.rpc::<()>(a)?;
+            Api::new(credentials)?.rpc::<()>(a)?;
             Ok(Event::Done("Backup updated".into()))
         });
     }
@@ -1085,6 +864,7 @@ fn field(ui: &mut egui::Ui, label: &str, text: &mut String) {
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.artwork.poll(ctx);
         if let Ok(event) = self.rx.try_recv() {
             self.busy = false;
             match event {
@@ -1101,134 +881,209 @@ impl eframe::App for App {
                 }
                 Ok(Event::Detail(d)) => {
                     if d.game == self.selected {
+                        if let Some(row) = self.games.iter_mut().find(|r| r.id == d.game) {
+                            row.device = d.device;
+                            row.mine = d.has_account_recipe;
+                        } else if d.device != DeviceState::New {
+                            self.games.push(Row {
+                                id: d.game.clone(),
+                                title: self.title.clone(),
+                                installed: false,
+                                mine: d.has_account_recipe,
+                                device: d.device,
+                                shared: false,
+                            });
+                            self.games.sort_by_cached_key(|r| r.title.to_lowercase());
+                        }
+                        if d.draft && self.note == "Setup saved" {
+                            self.note = "Setup queued on this device".into();
+                        }
                         self.launcher = d.launcher.clone().unwrap_or_default();
                         self.launcher_args = self.launcher.args.join("\n");
-                        if self.path.is_empty() && d.bindings.iter().any(|(k, _)| k == &self.slot) {
-                            self.slot = (2..)
-                                .map(|n| format!("saves-{n}"))
-                                .find(|s| !d.slots.iter().any(|(k, _, _)| k == s))
-                                .unwrap();
+                        if d.device.needs_locations() {
+                            self.page = GamePage::Files;
                         }
+                        self.review = None;
                         self.detail = Some(*d);
                     }
                 }
                 Ok(Event::Done(s)) => {
                     self.finished(s);
                 }
+                Ok(Event::ReviewStaged(message)) => {
+                    self.page = GamePage::Overview;
+                    self.review = None;
+                    self.finished(format!("Setup queued on this device. {message}"));
+                    self.error = true;
+                }
                 Ok(Event::Bound) => {
-                    self.path.clear();
-                    self.source = None;
-                    self.preview = SelectionPreview::default();
-                    self.finished("Selection saved".into());
+                    self.page = GamePage::Overview;
+                    self.review = None;
+                    self.finished("Setup saved".into());
                 }
                 Err(e) => {
-                    self.preview = SelectionPreview::default();
                     self.note = e;
                     self.error = true;
                 }
             }
         }
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Buddy").size(24.).strong());
-                if ui.button("Host server…").clicked() {
-                    let opened = (|| -> Result<()> {
-                        let mut cmd = Command::new(std::env::current_exe()?);
-                        if self.local.explicit_home {
-                            cmd.arg("--profile-dir").arg(&self.local.home);
-                        }
-                        #[cfg(windows)]
-                        {
-                            use std::os::windows::process::CommandExt;
-                            use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-                            cmd.creation_flags(CREATE_NO_WINDOW);
-                        }
-                        cmd.arg("host").spawn()?;
-                        Ok(())
-                    })();
-                    if let Err(e) = opened {
-                        self.error = true;
-                        self.note = e.to_string();
+        egui::TopBottomPanel::top("top")
+            .frame(
+                egui::Frame::new()
+                    .fill(phase::PANEL)
+                    .inner_margin(egui::Margin::symmetric(17, 10)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    phase::brand(ui);
+                    if ui.available_width() > 470. {
+                        let width = (ui.available_width() * 0.35).min(365.);
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(width, 24.), egui::Sense::hover());
+                        phase::traces(ui.painter(), rect, Some(1.));
                     }
-                }
-                if self.signed {
-                    ui.separator();
-                    ui.label(format!("{} · {}", self.account, self.device));
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("Refresh"))
-                        .clicked()
-                    {
-                        self.refresh();
-                    }
-                    ui.menu_button("Path suggestions", |ui| {
-                        if ui
-                            .add_enabled(!self.busy, egui::Button::new("Download from Ludusavi"))
-                            .clicked()
-                        {
-                            ui.close();
-                            self.job(|l| Ok(Event::Catalog(crate::manifest::download(&l)?)));
-                        }
-                        if ui
-                            .add_enabled(!self.busy, egui::Button::new("Import local YAML…"))
-                            .clicked()
-                        {
-                            ui.close();
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Ludusavi manifest", &["yaml", "yml"])
-                                .pick_file()
-                            {
-                                self.job(move |l| {
-                                    Ok(Event::Catalog(format!(
-                                        "Indexed {} games.",
-                                        crate::manifest::import(&l, &path)?
-                                    )))
+                    if self.signed {
+                        let show_device = ui.available_width() > 250.;
+                        let layout = egui::Layout::right_to_left(egui::Align::Center);
+                        ui.with_layout(layout, |ui| {
+                            ui.menu_button("Settings", |ui| {
+                                ui.strong(&self.account);
+                                ui.weak(&self.device);
+                                ui.separator();
+                                if ui.button("Host a server").clicked() {
+                                    ui.close();
+                                    self.launch_host();
+                                }
+                                if ui
+                                    .add_enabled(!self.busy, egui::Button::new("Refresh"))
+                                    .clicked()
+                                {
+                                    ui.close();
+                                    self.artwork = artwork::Artwork::new();
+                                    if self.selected.is_empty() {
+                                        self.refresh();
+                                    } else {
+                                        self.load();
+                                    }
+                                }
+                                ui.menu_button("Path suggestions", |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            !self.busy,
+                                            egui::Button::new("Download from Ludusavi"),
+                                        )
+                                        .clicked()
+                                    {
+                                        ui.close();
+                                        self.job(|l| {
+                                            Ok(Event::Catalog(crate::manifest::download(&l)?))
+                                        });
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            !self.busy,
+                                            egui::Button::new("Import local YAML…"),
+                                        )
+                                        .clicked()
+                                    {
+                                        ui.close();
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("Ludusavi manifest", &["yaml", "yml"])
+                                            .pick_file()
+                                        {
+                                            self.job(move |l| {
+                                                Ok(Event::Catalog(format!(
+                                                    "Indexed {} games.",
+                                                    crate::manifest::import(&l, &path)?
+                                                )))
+                                            });
+                                        }
+                                    }
                                 });
+                                if ui
+                                    .add_enabled(!self.busy, egui::Button::new("Switch account"))
+                                    .clicked()
+                                {
+                                    ui.close();
+                                    self.signed = false;
+                                    self.leave_game();
+                                    self.games.clear();
+                                    self.switch_account();
+                                    self.filter.clear();
+                                    self.library_filter = LibraryFilter::All;
+                                }
+                            });
+                            if show_device {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&self.device).color(phase::MUTED),
+                                    )
+                                    .truncate(),
+                                );
                             }
-                        }
-                    });
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("Switch account"))
-                        .clicked()
-                    {
-                        self.signed = false;
-                        self.selected.clear();
-                        self.detail = None;
-                        self.games.clear();
+                        });
                     }
-                }
+                });
             });
-        });
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if self.busy {
-                    ui.spinner();
-                }
-                if self.error {
-                    ui.colored_label(ui.visuals().error_fg_color, &self.note);
-                } else {
-                    ui.label(&self.note);
-                }
-            });
-        });
-        if self.signed {
-            egui::SidePanel::left("library")
-                .default_width(275.)
+        if self.busy || !self.note.is_empty() {
+            egui::TopBottomPanel::bottom("status")
+                .frame(
+                    egui::Frame::new()
+                        .fill(phase::PANEL)
+                        .inner_margin(egui::Margin::symmetric(18, 7)),
+                )
                 .show(ctx, |ui| {
-                    ui.add_enabled_ui(!self.busy, |ui| self.library(ui));
+                    ui.horizontal_wrapped(|ui| {
+                        if self.busy {
+                            ui.spinner();
+                        }
+                        let color = if self.error {
+                            ui.visuals().error_fg_color
+                        } else {
+                            phase::TEXT
+                        };
+                        ui.colored_label(color, &self.note);
+                    });
                 });
         }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(10.);
-            ui.add_enabled_ui(!self.busy, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if self.signed {
-                        self.game(ui)
+        let margin = if ctx.screen_rect().width() < 700. {
+            14
+        } else {
+            26
+        };
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(phase::INK)
+                    .inner_margin(egui::Margin::symmetric(margin, 16)),
+            )
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(!self.busy, |ui| {
+                    if self.signed && self.selected.is_empty() {
+                        self.library(ui);
                     } else {
-                        self.login(ui)
+                        egui::ScrollArea::vertical()
+                            .id_salt(("page", &self.selected, self.signed))
+                            .show(ui, |ui| {
+                                if self.signed {
+                                    self.game(ui);
+                                } else {
+                                    let width = ui.available_width().min(470.);
+                                    ui.add_space(8.);
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(
+                                            ((ui.available_width() - width) * 0.5).max(0.),
+                                        );
+                                        ui.vertical(|ui| {
+                                            ui.set_width(width - 10.);
+                                            phase::panel().show(ui, |ui| self.login(ui));
+                                        });
+                                    });
+                                }
+                            });
                     }
                 });
             });
-        });
         if self.busy {
             ctx.request_repaint_after(Duration::from_millis(100));
         }

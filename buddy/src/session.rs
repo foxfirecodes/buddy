@@ -81,10 +81,10 @@ struct Online<'a> {
 }
 impl Online<'_> {
     fn commit(&mut self, tree: &Tree, close: bool) -> Result<i64> {
-        let progress = crate::ui::Progress::start(self.ui, "Checking missing chunks…");
-        self.api.upload(self.cache, tree, |d, t| {
-            progress.transfer("Uploading", d, t)
-        })?;
+        let progress =
+            crate::ui::Progress::start(self.ui, &self.scope.title, "Checking missing chunks…");
+        self.api
+            .upload(self.cache, tree, |d, t| progress.uploaded(d, t))?;
         drop(progress);
         let full = self
             .head
@@ -122,10 +122,10 @@ impl Online<'_> {
             self.commit(tree, false)?;
             return Ok(tree.clone());
         }
-        let progress = crate::ui::Progress::start(self.ui, "Checking missing chunks…");
-        self.api.upload(self.cache, tree, |d, t| {
-            progress.transfer("Uploading", d, t)
-        })?;
+        let progress =
+            crate::ui::Progress::start(self.ui, &self.scope.title, "Checking missing chunks…");
+        self.api
+            .upload(self.cache, tree, |d, t| progress.uploaded(d, t))?;
         drop(progress);
         let local: i64 = self.api.rpc(Action::Conflict {
             lease: self.lease.clone(),
@@ -134,23 +134,45 @@ impl Online<'_> {
             time,
             op: id(),
         })?;
-        let details = format!(
-            "Both versions have permanent backups.\n\nThis device: {} · captured {} · {} (backup #{local})\n{}\n\nServer: {} · committed {} · {} (backup #{})\n{}",
-            self.api.c.device,
-            when(time),
-            tree.summary(),
-            tree.changes(base),
-            remote.origin,
-            when(remote.time),
-            remote_tree.summary(),
-            remote.id,
-            remote_tree.changes(base)
-        );
-        match self.ui.choose(
-            "Which save should Buddy continue with?",
-            &details,
-            &["Use this device", "Use server copy", "Decide later"],
-        )? {
+        let picked = if matches!(self.ui, Interface::Window) {
+            let copy = |device: &str, time, tree: &Tree, backup| {
+                let (files, bytes) = tree.file_totals();
+                crate::ui::SaveCopy {
+                    device: device.to_owned(),
+                    time,
+                    files,
+                    bytes,
+                    changes: tree.changes(base),
+                    backup,
+                }
+            };
+            crate::ui::choose_conflict(
+                &self.scope.title,
+                [
+                    copy(&self.api.c.device, time, tree, local),
+                    copy(&remote.origin, remote.time, &remote_tree, remote.id),
+                ],
+            )?
+        } else {
+            let details = format!(
+                "Both versions have permanent backups.\n\nThis device: {} · captured {} · {} (backup #{local})\n{}\n\nServer: {} · committed {} · {} (backup #{})\n{}",
+                self.api.c.device,
+                when(time),
+                tree.summary(),
+                tree.changes(base),
+                remote.origin,
+                when(remote.time),
+                remote_tree.summary(),
+                remote.id,
+                remote_tree.changes(base)
+            );
+            self.ui.choose(
+                "Which save should Buddy continue with?",
+                &details,
+                &["Use this device", "Use server copy", "Decide later"],
+            )?
+        };
+        match picked {
             0 => {
                 self.commit(tree, false)?;
                 Ok(tree.clone())
@@ -279,11 +301,20 @@ pub struct RunOptions {
     pub manual: bool,
     pub restore: Option<i64>,
     pub pin: bool,
+    pub expected_scope: Option<String>,
 }
 pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -> Result<i32> {
     let c = local.credentials()?;
+    let account = local.scope(&c);
+    ensure!(
+        options
+            .expected_scope
+            .as_ref()
+            .is_none_or(|s| s == &account),
+        "account changed; reopen the game"
+    );
     let api = Api::new(c.clone())?;
-    let _game_lock = local.lock(&format!("{}:{g}", local.scope(&c)))?;
+    let _game_lock = local.lock(&format!("{account}:{g}"))?;
     #[cfg(target_os = "linux")]
     let mut s = crate::proton::first_launch(
         local,
@@ -318,6 +349,25 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
         "choose at least one file or directory for this device"
     );
     let files = Files::open(&scope, &s.bindings, &local.home)?;
+    if let Some(id) = options.restore
+        && matches!(ui, Interface::Window)
+    {
+        // These approved device bindings now hold the same locks used for restore.
+        let targets = scope
+            .slots
+            .keys()
+            .map(|name| s.bindings[name].path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        ensure!(
+            ui.choose(
+                "Restore backup",
+                &format!("Restore backup #{id} to the server and these locations?\n\n{targets}"),
+                &["Cancel", "Restore"]
+            )? == 1,
+            "cancelled"
+        );
+    }
     let _cache_lock = local.cache_lock(&c, false)?;
     let cache = local.cache(&c)?;
     if let Some(plan) = s.restore.clone() {
@@ -391,8 +441,11 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
                                 return Err(error);
                             }
                         };
-                        let _capture =
-                            crate::ui::Progress::start(ui, "Preserving offline progress…");
+                        let _capture = crate::ui::Progress::start(
+                            ui,
+                            &s.recipe.title,
+                            "Preserving offline progress…",
+                        );
                         finish_local(true, local, &c, &mut s, &files, &cache)
                             .context(PostGame(code))?;
                         return Ok(code);
@@ -438,6 +491,7 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
         // Queue entries contain immutable bytes, so choosing a remote winner cannot erase later offline sessions.
         progress = Some(crate::ui::Progress::start(
             ui,
+            &s.recipe.title,
             "Checking local saves and pending sessions…",
         ));
         let restore_target = options
@@ -460,6 +514,7 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
         if restoring_backup || next != live {
             progress = Some(crate::ui::Progress::start(
                 ui,
+                &s.recipe.title,
                 if restoring_backup {
                     "Downloading and verifying the selected backup…"
                 } else {
@@ -471,9 +526,12 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
             files.prepare_rollback(&live, &next, &cache, &mut chunks)?;
             api.download(&cache, chunks, |d, t| {
                 if let Some(p) = &progress {
-                    p.transfer("Downloading", d, t)
+                    p.downloaded(d, t)
                 }
             })?;
+            if let Some(p) = &progress {
+                p.status("Verifying game files…");
+            }
             if restoring_backup {
                 online.commit(&next, false)?;
             }
@@ -529,7 +587,8 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
         };
         completed_code = Some(code);
         {
-            let _progress = crate::ui::Progress::start(ui, "Capturing changed files…");
+            let _progress =
+                crate::ui::Progress::start(ui, &s.recipe.title, "Capturing changed files…");
             finish_local(true, local, &c, &mut s, &files, &cache)?;
         }
         let tree = s.base.clone().context("missing captured state")?;
@@ -539,10 +598,9 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
                 && let Some(p) = s.pending.last()
             {
                 // The other player keeps the lease. Both versions become durable backups immediately.
-                let progress = crate::ui::Progress::start(ui, "Preserving this session…");
-                api.upload(&cache, &p.tree, |d, t| {
-                    progress.transfer("Preserving backup", d, t)
-                })?;
+                let progress =
+                    crate::ui::Progress::start(ui, &s.recipe.title, "Preserving this session…");
+                api.upload(&cache, &p.tree, |d, t| progress.uploaded(d, t))?;
                 api.rpc::<i64>(Action::Preserve {
                     game: g.into(),
                     slots: scope.slots.keys().cloned().collect(),

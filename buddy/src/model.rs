@@ -248,7 +248,7 @@ impl Tree {
             .iter()
             .any(|(p, e)| p.contains('/') || matches!(e, Entry::File { .. }))
     }
-    pub fn summary(&self) -> String {
+    pub fn file_totals(&self) -> (u64, u64) {
         let (mut count, mut bytes) = (0u64, 0u64);
         for entry in self.0.values() {
             if let Entry::File { size, .. } = entry {
@@ -256,6 +256,10 @@ impl Tree {
                 bytes += size;
             }
         }
+        (count, bytes)
+    }
+    pub fn summary(&self) -> String {
+        let (count, bytes) = self.file_totals();
         format!(
             "{count} {}, {bytes} {}",
             if count == 1 { "file" } else { "files" },

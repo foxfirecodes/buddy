@@ -9,6 +9,7 @@ To build the sync app from source, run `cargo build --locked --release -p buddy`
 - [Test from Windows Steam](docs/windows-steam.md) with a disposable game on Windows or in a Dockur guest.
 - [Restore both sides of an offline Terraria conflict](docs/offline-terraria.md), [restore before a first Proton launch](docs/proton-first-play.md), or [reproduce the large-world and disk-full trials](docs/storage-trial.md).
 - [Read the product and protocol spec](SPEC.md) for design decisions and planned features.
+- [Phase design language](docs/design-language.md) describes Buddy’s visual style and links to the interactive reference.
 - [Run the Steam Deck launch probe](#buddy-launch-probe) to measure when Game Mode lets post-game work finish. This is a separate executable and experiment.
 
 ## Buddy launch probe

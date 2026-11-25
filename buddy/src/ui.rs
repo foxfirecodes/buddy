@@ -70,7 +70,8 @@ enum GamePage {
     Settings,
 }
 enum Event {
-    Signed(Vec<Row>),
+    Signed,
+    ChooseCredentialStorage(Credentials),
     Catalog(String),
     Bound,
     ReviewStaged(String),
@@ -906,9 +907,16 @@ impl eframe::App for App {
         if let Ok(event) = self.rx.try_recv() {
             self.busy = false;
             match event {
-                Ok(Event::Signed(g)) => {
+                Ok(Event::Signed) => {
+                    self.join_step = JoinStep::Account;
                     self.signed = true;
-                    self.games = g;
+                    self.refresh();
+                }
+                Ok(Event::ChooseCredentialStorage(credentials)) => {
+                    if matches!(self.join_step, JoinStep::Storage(_)) {
+                        self.note = "The credential store is still unavailable.".into();
+                    }
+                    self.join_step = JoinStep::Storage(credentials);
                 }
                 Ok(Event::Games(g)) => self.games = g,
                 Ok(Event::Catalog(msg)) => {

@@ -13,6 +13,8 @@ In Buddy, choose **Join a server**. On the host computer, choose **Use my hosted
 
 Choose **Use an invite** on the first device. Enter the invite, account name, password, and device name and choose **Create account**. On the second device, sign into the same account and give the device a different name. A second player can create a separate account using their own invite.
 
+If the system credential store is unavailable, choose **Use private app data** to keep the device token in Buddy’s local profile, or unlock the store and choose **Retry credential store**. Both choices finish the same sign-in, including when you used an invite. Buddy only uses your password to sign in.
+
 These clients must be able to reach the selected IP and TCP port. If your firewall prompts when the host starts, allow incoming access for the home network. The host window runs as your current user. For unattended hosting, run the same executable with `buddy serve --config PATH_TO_SERVER_TOML`; expand **Server data folder** in the host window to find that TOML. The graphical host and the headless process share the same settings and cannot both listen on the same port.
 
 The CLI supports `buddy login SERVER_URL ACCOUNT --pairing PATH_TO_PAIRING_FILE`. The TUI prompts for a pairing file at sign-in. Manually configured servers with a publicly or system-trusted HTTPS certificate can still use the normal server URL.

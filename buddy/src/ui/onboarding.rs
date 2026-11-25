@@ -1,18 +1,32 @@
 use super::{App, Event, phase_heading};
 use crate::{
     host,
-    local::{self, Api},
-    model::Login,
-    phase, setup,
+    local::{self, Api, Local},
+    model::{Credentials, Login},
+    phase,
 };
 use eframe::egui;
 use std::{path::Path, process::Command};
 
-#[derive(Clone, Copy)]
 pub(super) enum JoinStep {
     Welcome,
     Server,
     Account,
+    Storage(Credentials),
+}
+
+fn save_sign_in(
+    local: &Local,
+    credentials: Credentials,
+    private_file: bool,
+) -> anyhow::Result<Event> {
+    match local.set_login(&credentials, private_file) {
+        Ok(()) => Ok(Event::Signed),
+        Err(error) if !private_file && error.is::<keyring::Error>() => {
+            Ok(Event::ChooseCredentialStorage(credentials))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 impl App {
@@ -62,6 +76,7 @@ impl App {
             }
             JoinStep::Server => self.join_server(ui),
             JoinStep::Account => self.account_form(ui),
+            JoinStep::Storage(_) => self.credential_storage(ui),
         }
     }
 
@@ -193,13 +208,37 @@ impl App {
             let private_file = self.private_file;
             let pairing = self.pairing.clone();
             self.job(move |l| {
-                l.set_login(
-                    &Api::login_paired(&url, login, pairing.as_ref())?,
-                    private_file,
-                )?;
-                Ok(Event::Signed(setup::games(&l)?))
+                let credentials = Api::login_paired(&url, login, pairing.as_ref())?;
+                save_sign_in(&l, credentials, private_file)
             });
         }
+    }
+
+    fn credential_storage(&mut self, ui: &mut egui::Ui) {
+        phase_heading(ui, "Credential storage");
+        ui.label("The system credential store is unavailable. Save this device’s sign-in token in Buddy’s private app data?");
+        ui.add_space(8.);
+        ui.horizontal_wrapped(|ui| {
+            let private = ui.add(phase::primary("Use private app data")).clicked();
+            let retry = ui.button("Retry credential store").clicked();
+            if (private || retry)
+                && let JoinStep::Storage(credentials) = &self.join_step
+            {
+                let credentials = credentials.clone();
+                self.job(move |local| save_sign_in(&local, credentials, private));
+            }
+            if ui.button("Cancel").clicked() {
+                self.note = if self.register {
+                    "Account created. Sign in to finish on this device."
+                } else {
+                    "Sign-in wasn’t saved on this device."
+                }
+                .into();
+                self.error = false;
+                self.register = false;
+                self.join_step = JoinStep::Account;
+            }
+        });
     }
 
     pub(super) fn switch_account(&mut self) {

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::BTreeMap,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -447,6 +448,18 @@ pub(crate) fn checked(r: Response) -> Result<Response> {
         )
         .into())
     }
+}
+pub(crate) const METADATA_LIMIT: u64 = 32 * 1024;
+pub(crate) fn small_json<T: DeserializeOwned>(response: reqwest::blocking::Response) -> Result<T> {
+    let mut buf = vec![];
+    checked(response)?
+        .take(METADATA_LIMIT + 1)
+        .read_to_end(&mut buf)?;
+    ensure!(
+        buf.len() <= METADATA_LIMIT as usize,
+        "response exceeds size limit"
+    );
+    Ok(serde_json::from_slice(&buf)?)
 }
 fn ambiguous_reply(e: &anyhow::Error) -> bool {
     if let Some(status) = e.downcast_ref::<ApiError>() {

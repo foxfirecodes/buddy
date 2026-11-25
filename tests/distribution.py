@@ -3,7 +3,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import secrets
 import shutil
+import ssl
 import sqlite3
 import subprocess
 import sys
@@ -28,6 +30,72 @@ def issue(url, token):
     return json.load(urllib.request.urlopen(req, timeout=10))
 
 
+def device_codes(url, root, owner, tls):
+    context = ssl.create_default_context(cafile=str(root/"ca.pem")) if tls else None
+    with sqlite3.connect(owner/"client.sqlite3") as profile:
+        login = json.loads(profile.execute("SELECT v FROM state WHERE k='login'").fetchone()[0])
+    with sqlite3.connect(root/"server.sqlite") as db:
+        def post(action, body=None, token=None, expected=200):
+            headers = {"Content-Type": "application/json"}
+            if token:
+                headers["Authorization"] = "Bearer " + token
+            req = urllib.request.Request(url + "/v1/device-signins" + action,
+                data=json.dumps(body).encode(), headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=5, context=context) as response:
+                    assert response.status == expected and response.headers["Cache-Control"] == "no-store"
+                    data = response.read()
+                    return json.loads(data) if data else None
+            except HTTPError as error:
+                assert error.code == expected, (action, error.code, expected)
+
+        ticket = post("", "Handheld")
+        code, secret = ticket["code"], ticket["secret"]
+        assert len(code) == 8 and code.isascii() and code.isdigit()
+        assert ticket["expires_in"] == 600 and len(secret) == 64
+        assert post("/poll", token=secret) is None
+        claim = {"account": login["account"], "token_hash": secrets.token_hex(32)}
+        post("/finish", claim, secret, 410)
+        post("/review", code, expected=401)
+        post("/poll", token=code, expected=410)
+        review = post("/review", code, login["token"])
+        assert review["device"] == "Handheld"
+        post("/approve", review["request"], expected=401)
+        post("/approve", review["request"], login["token"], 204)
+        assert post("/poll", token=secret) == login["account"]
+        post("/finish", dict(claim, account="different"), secret, 410)
+        assert not db.execute("SELECT 1 FROM devices WHERE token=?", (claim["token_hash"],)).fetchone()
+
+        # Both finish requests have the same authorized secret and race the same grant.
+        with ThreadPoolExecutor(2) as pool:
+            def finish(_):
+                req = urllib.request.Request(url + "/v1/device-signins/finish",
+                    data=json.dumps(claim).encode(), headers={"Content-Type": "application/json",
+                    "Authorization": "Bearer " + secret})
+                try:
+                    with urllib.request.urlopen(req, context=context, timeout=5) as res:
+                        return res.status
+                except HTTPError as e:
+                    return e.code
+            assert sorted(pool.map(finish, [0, 1])) == [204, 410]
+        added, = db.execute("SELECT id FROM devices WHERE token=?", (claim["token_hash"],)).fetchone()
+        execute([BUDDY, "--profile-dir", owner, "revoke", added])
+        post("/poll", token=secret, expected=410)
+
+        abandoned = post("", "Cancelled")
+        pending = post("/review", abandoned["code"], login["token"])
+        post("/cancel", token=abandoned["secret"], expected=204)
+        post("/approve", pending["request"], login["token"], 410)
+        expired = post("", "Expired")
+        with db:
+            db.execute("UPDATE device_signins SET expires=0")
+        post("/poll", token=expired["secret"], expected=410)
+        for _ in range(3):
+            post("/review", expired["code"], login["token"], 404)
+        post("/review", expired["code"], login["token"], 429)
+    print("PASS device sign-in, cancellation, expiry, rate limiting, and single-use approval", flush=True)
+
+
 def run(root, tls):
     root.mkdir()
     db = root / "server.sqlite"
@@ -36,10 +104,12 @@ def run(root, tls):
     if tls:
         openssl = ["openssl", "req", "-newkey", "rsa:2048", "-nodes"]
         execute(openssl + ["-x509", "-keyout", str(root/"ca.key"), "-out", str(root/"ca.pem"),
-                           "-days", "2", "-subj", "/CN=Fixture CA", "-addext", "basicConstraints=critical,CA:TRUE"])
+                           "-days", "2", "-subj", "/CN=Fixture CA", "-addext", "basicConstraints=critical,CA:TRUE",
+                           "-addext", "keyUsage=critical,keyCertSign,cRLSign", "-addext", "subjectKeyIdentifier=hash"])
         execute(openssl + ["-keyout", str(root/"server.key"), "-out", str(root/"server.csr"),
                            "-subj", "/CN=loopback"])
-        (root/"extensions").write_text("subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n")
+        (root/"extensions").write_text("subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n"
+                                      "authorityKeyIdentifier=keyid,issuer\nsubjectKeyIdentifier=hash\n")
         execute(["openssl", "x509", "-req", "-in", str(root/"server.csr"), "-CA", str(root/"ca.pem"),
                  "-CAkey", str(root/"ca.key"), "-CAcreateserial", "-days", "2", "-extfile",
                  str(root/"extensions"), "-out", str(root/"server.pem")])
@@ -72,6 +142,7 @@ def run(root, tls):
             pairing = ["--pairing", pair]
         execute(owner_cli + ["login", url, "player", "--device", "desktop", "--invite", invite,
                              "--password-stdin", "--private-file-credential"] + pairing, input="a-fixture-password\n")
+        device_codes(url, root, owner, tls)
         publish = [BUDDY, "server", "publish-release", "--config", cfg]
         link = owner_cli + ["install-command", PLATFORM]
         assert "publish-release" in execute(link, ok=False)

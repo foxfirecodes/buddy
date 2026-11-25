@@ -15,6 +15,7 @@ pub(super) enum JoinStep {
     Account {
         private_only: bool,
     },
+    DeviceCode(Box<super::code_signin::CodeScreen>),
     Storage {
         credentials: Credentials,
         private_only: bool,
@@ -91,7 +92,7 @@ fn saved_sign_in(local: &Local) -> Event {
     Event::Onboarding(JoinStep::SavedSignIn(record, issue))
 }
 
-fn save_sign_in(
+pub(super) fn save_sign_in(
     local: &Local,
     credentials: Credentials,
     private_file: bool,
@@ -176,6 +177,7 @@ impl App {
                     self.join_step = JoinStep::Server;
                 }
             }
+            JoinStep::DeviceCode(_) => self.device_code_screen(ui),
             JoinStep::Server => self.join_server(ui),
             JoinStep::Account { private_only } => self.account_form(ui, private_only),
             JoinStep::Storage { private_only, .. } => self.credential_storage(ui, private_only),
@@ -273,6 +275,17 @@ impl App {
                 ui.monospace(pair.fingerprint());
             }
         });
+        if !self.register
+            && ui
+                .add_sized(
+                    [ui.available_width(), 46.],
+                    phase::primary("Sign in with a device code"),
+                )
+                .clicked()
+        {
+            self.start_device_code(private_only);
+            return;
+        }
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.register, false, "Existing account");
             ui.selectable_value(&mut self.register, true, "Use an invite");

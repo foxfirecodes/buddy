@@ -18,6 +18,7 @@ base64 = "0.22"
 hex = "0.4"
 object = { version = "0.39", default-features = false, features = ["read_core", "elf", "pe", "std"] }
 ring = "0.17"
+rand = "0.9"
 tokio-util = { version = "0.7", features = ["io"] }
 cap-std = "3"
 cap-primitives = "3"

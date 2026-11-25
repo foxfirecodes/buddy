@@ -1,3 +1,4 @@
+mod device_code;
 mod distribution;
 mod files;
 mod host;
@@ -93,7 +94,14 @@ enum Cmd {
         /// Trust the host certificate in this server pairing file.
         #[arg(long)]
         pairing: Option<PathBuf>,
-        account: String,
+        #[arg(
+            required_unless_present = "device_code",
+            conflicts_with = "device_code"
+        )]
+        account: Option<String>,
+        /// Show a code to approve on an already signed-in device.
+        #[arg(long, conflicts_with_all = ["invite", "password_stdin"])]
+        device_code: bool,
         #[arg(long)]
         device: Option<String>,
         #[arg(long, env = "BUDDY_INVITE", hide_env_values = true)]
@@ -103,6 +111,8 @@ enum Cmd {
         #[arg(long,env="BUDDY_ALLOW_FILE_CREDENTIAL",action=clap::ArgAction::SetTrue)]
         private_file_credential: bool,
     },
+    /// Review a code from another device and approve signing it in to this account.
+    ApproveDevice { code: String },
     /// Reclaim local chunks outside active or pending snapshots.
     CacheGc,
     /// Publish reviewed changes to a cached recipe.
@@ -444,15 +454,29 @@ fn dispatch(args: Args) -> Result<i32> {
                     );
                 }
 
+                Cmd::ApproveDevice { code } => ui::approve_terminal(&l, &code)?,
                 Cmd::Login {
                     url,
                     pairing,
                     account,
+                    device_code,
                     device,
                     invite,
                     password_stdin,
                     private_file_credential,
                 } => {
+                    let pair = pairing.as_deref().map(host::Pairing::load).transpose()?;
+                    let device = device.unwrap_or_else(local::default_device);
+                    if device_code {
+                        ui::device_login_terminal(
+                            &l,
+                            &url,
+                            pair.as_ref(),
+                            device,
+                            private_file_credential,
+                        )?;
+                        return Ok(0);
+                    }
                     let password = if password_stdin {
                         let mut p = String::new();
                         io::stdin().lock().read_line(&mut p)?;
@@ -462,14 +486,14 @@ fn dispatch(args: Args) -> Result<i32> {
                             .without_confirmation()
                             .prompt()?
                     };
-                    let pair = pairing.as_deref().map(host::Pairing::load).transpose()?;
                     l.set_login(
                         &Api::login_paired(
                             &url,
                             Login {
-                                account,
+                                account: account
+                                    .context("enter an account name or use --device-code")?,
                                 password,
-                                device: device.unwrap_or_else(local::default_device),
+                                device,
                                 invite,
                             },
                             pair.as_ref(),

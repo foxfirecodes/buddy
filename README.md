@@ -36,6 +36,10 @@ Run `mise run stage` on your Linux build machine, then copy `server-stage/` besi
 ./server-stage/buddy-linux-x86_64 server publish-release --config server.toml windows-x86_64 ./server-stage/buddy-windows-x86_64.exe
 ```
 
+**Already installed on the new device?** Join your server using its address or pairing file and tap **Sign in with a device code**. On a signed-in device, open **Settings → Approve a device**, enter the eight digits, and approve the displayed device name. Back on the new device, tap **Sign in as** with your account name. The code lasts ten minutes. To use this on an existing setup, update the server and both participating clients.
+
+In a terminal, use `buddy login URL --device-code` on the new device and `buddy approve-device 12345678` on your signed-in device. The existing `--pairing PATH` and `--private-file-credential` login options also work with device codes.
+
 On a signed-in client, open **Settings → Pair a device**, choose the destination platform, and copy the command. Paste it into a shell on Linux or PowerShell on Windows. The command verifies and installs the build, links the device to your account, then offers **Add Buddy to Steam**. Anyone with the command can join your account once within ten minutes. With plain HTTP, use a trusted network, since the connection carries credentials.
 
 The terminal equivalent is `buddy install-command linux-x86_64` or `buddy install-command windows-x86_64`. The first time an HTTP client pairs or updates, compare the five groups on its screen with the verification code from `buddy server status` on the host. If all five match, confirm to remember the full public key. For an unattended CLI, pass the host’s full public key with `--trust-key KEY`. Paired HTTPS clients use their existing server certificate. The new device receives the trusted signing key in the copied command.

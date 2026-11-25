@@ -1,13 +1,13 @@
 //! Account-bound device enrollment and host-signed, per-platform client builds.
 use crate::{
-    local::{Local, canonical_url, checked, default_device, http},
+    local::{Local, METADATA_LIMIT, canonical_url, checked, default_device, http, small_json},
     model::{Credentials, digest, hash_ok, id, key},
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use object::Object;
 use ring::{digest as sha, signature};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
@@ -17,7 +17,6 @@ use std::{
 use tempfile::NamedTempFile;
 
 pub(crate) const MAX_BINARY: u64 = 512 * 1024 * 1024;
-const METADATA_LIMIT: u64 = 32768;
 
 pub(crate) fn installer_script(platform: &str) -> Option<&'static str> {
     match platform {
@@ -125,17 +124,6 @@ pub(crate) fn verify_platform(path: &Path, platform: &str) -> Result<()> {
     Ok(())
 }
 
-fn small_json<T: DeserializeOwned>(response: reqwest::blocking::Response) -> Result<T> {
-    let mut buf = vec![];
-    checked(response)?
-        .take(METADATA_LIMIT + 1)
-        .read_to_end(&mut buf)?;
-    ensure!(
-        buf.len() <= METADATA_LIMIT as usize,
-        "response exceeds size limit"
-    );
-    Ok(serde_json::from_slice(&buf)?)
-}
 fn latest(c: &Credentials, platform: &str) -> Result<SignedRelease> {
     ensure!(
         platform_ok(platform),

@@ -660,6 +660,7 @@ dependencies = [
  "keyring",
  "keyvalues-parser",
  "object",
+ "rand 0.9.5",
  "rcgen",
  "reqwest",
  "rfd",

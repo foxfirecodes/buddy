@@ -17,9 +17,16 @@ pub(super) enum ReleaseAction {
     Update,
 }
 
-pub(super) enum ReleaseDialog {
+pub(super) enum DeviceDialog {
     Trust(ReleaseAction, distribution::UntrustedReleaseKey),
     Command(String),
+    EnterCode(String),
+    Approve {
+        review: crate::device_code::Review,
+        scope: String,
+        account: String,
+        server: String,
+    },
 }
 
 pub(crate) fn list_profiles() -> Result<()> {
@@ -185,7 +192,7 @@ impl App {
             let outcome = match action {
                 ReleaseAction::Pair(platform) => {
                     distribution::install_command(&local, &credentials, platform, pin)
-                        .map(|command| Event::ReleaseDialog(ReleaseDialog::Command(command)))
+                        .map(|command| Event::DeviceDialog(DeviceDialog::Command(command)))
                 }
                 ReleaseAction::Update => update::run(&local, &credentials, pin, || {
                     Ok(choose(
@@ -205,7 +212,7 @@ impl App {
             };
             outcome.or_else(|error| {
                 let key = error.downcast::<distribution::UntrustedReleaseKey>()?;
-                Ok(Event::ReleaseDialog(ReleaseDialog::Trust(action, key)))
+                Ok(Event::DeviceDialog(DeviceDialog::Trust(action, key)))
             })
         });
     }
@@ -217,6 +224,11 @@ impl App {
                 self.steam_action(None, Some(true));
             }
             if self.signed {
+                if ui.button("Approve a device…").clicked() {
+                    ui.close();
+                    self.error = None;
+                    self.device_dialog = Some(DeviceDialog::EnterCode(String::new()));
+                }
                 ui.menu_button("Pair a device", |ui| {
                     for (label, platform) in [
                         ("Linux / Steam Deck", "linux-x86_64"),
@@ -257,14 +269,21 @@ impl App {
             }
             return;
         }
-        let Some(dialog) = &mut self.release_dialog else {
+        if matches!(
+            self.device_dialog,
+            Some(DeviceDialog::EnterCode(_) | DeviceDialog::Approve { .. })
+        ) {
+            self.show_approval_dialog(ctx);
+            return;
+        }
+        let Some(dialog) = &mut self.device_dialog else {
             return;
         };
         let mut retry = None;
         let response = egui::Modal::new("device-release".into()).show(ctx, |ui| {
             ui.set_max_width((ctx.screen_rect().width() - 60.).clamp(160., 520.));
             match dialog {
-                ReleaseDialog::Trust(action, key) => {
+                DeviceDialog::Trust(action, key) => {
                     ui.heading("Compare release key");
                     ui.label(&key.server);
                     ui.label("Compare this code with buddy server status on your host.");
@@ -283,7 +302,8 @@ impl App {
                     })
                     .inner
                 }
-                ReleaseDialog::Command(command) => {
+                DeviceDialog::EnterCode(_) | DeviceDialog::Approve { .. } => unreachable!(),
+                DeviceDialog::Command(command) => {
                     ui.heading("Pair a device");
                     ui.label("Run this one-time command on your new device.");
                     egui::ScrollArea::vertical()
@@ -311,7 +331,7 @@ impl App {
             }
         });
         if response.inner || response.should_close() {
-            self.release_dialog = None;
+            self.device_dialog = None;
         }
         if let Some((action, key)) = retry {
             self.release_action(action, Some(key));

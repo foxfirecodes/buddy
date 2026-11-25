@@ -35,6 +35,8 @@ pub(crate) fn native(size: [f32; 2]) -> eframe::NativeOptions {
 
 use crate::phase;
 mod artwork;
+mod code_signin;
+pub(crate) use code_signin::{approve_terminal, device_login_terminal};
 mod history;
 mod offline;
 mod onboarding;
@@ -85,7 +87,7 @@ enum Event {
     Prepared(String, Result<String>),
     Done(String),
     Notice(String),
-    ReleaseDialog(desktop::ReleaseDialog),
+    DeviceDialog(desktop::DeviceDialog),
     Restarted,
 }
 type Reply = Result<Event>;
@@ -96,7 +98,7 @@ struct App {
     busy: bool,
     signed: bool,
     offer_steam: bool,
-    release_dialog: Option<desktop::ReleaseDialog>,
+    device_dialog: Option<desktop::DeviceDialog>,
     join_step: JoinStep,
     url: String,
     account: String,
@@ -249,7 +251,7 @@ impl App {
             busy: false,
             signed: false,
             offer_steam,
-            release_dialog: None,
+            device_dialog: None,
             join_step: JoinStep::Opening,
             url: "http://127.0.0.1:7341".into(),
             account: String::new(),
@@ -1038,7 +1040,7 @@ impl eframe::App for App {
                     }
                 }
                 Ok(Event::Notice(s)) => self.note = s,
-                Ok(Event::ReleaseDialog(d)) => self.release_dialog = Some(d),
+                Ok(Event::DeviceDialog(d)) => self.device_dialog = Some(d),
                 Ok(Event::Restarted) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 Ok(Event::Done(s)) => {
                     self.finished(s);
@@ -1263,6 +1265,8 @@ pub fn tui(l: &Local) -> Result<()> {
             vec![
                 "Games",
                 "Prepare for offline play",
+                "Sign in with a device code",
+                "Approve a device",
                 "Sign in",
                 "Add non-Steam game",
                 "Quit",
@@ -1272,7 +1276,12 @@ pub fn tui(l: &Local) -> Result<()> {
         if item == "Quit" {
             return Ok(());
         }
-        if item == "Sign in" {
+        if item == "Approve a device" {
+            let code = Text::new("Code on the device signing in").prompt()?;
+            approve_terminal(l, &code)?;
+            continue;
+        }
+        if matches!(item, "Sign in" | "Sign in with a device code") {
             let path = Text::new("Server pairing file (blank to enter a URL)").prompt()?;
             let pairing = (!path.is_empty())
                 .then(|| crate::host::Pairing::load(Path::new(&path)))
@@ -1285,9 +1294,6 @@ pub fn tui(l: &Local) -> Result<()> {
                     .with_default("http://127.0.0.1:7341")
                     .prompt()?
             };
-            let account = Text::new("Account").prompt()?;
-            let password = Password::new("Password").without_confirmation().prompt()?;
-            let invite = Text::new("Invite (blank for existing account)").prompt()?;
             let device = Text::new("Device")
                 .with_default(&default_device())
                 .prompt()?;
@@ -1304,6 +1310,13 @@ pub fn tui(l: &Local) -> Result<()> {
                     .with_default(false)
                     .prompt()?
             };
+            if item == "Sign in with a device code" {
+                device_login_terminal(l, &url, pairing.as_ref(), device, private_file)?;
+                continue;
+            }
+            let account = Text::new("Account").prompt()?;
+            let password = Password::new("Password").without_confirmation().prompt()?;
+            let invite = Text::new("Invite (blank for existing account)").prompt()?;
             l.set_login(
                 &Api::login_paired(
                     &url,

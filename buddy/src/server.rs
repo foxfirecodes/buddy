@@ -20,6 +20,7 @@ use std::{
     time::Duration,
 };
 
+mod device_codes;
 mod releases;
 pub use releases::{publish_release, status};
 
@@ -101,6 +102,9 @@ struct User {
     name: String,
 }
 fn who(c: &Connection, token: &str) -> Result<User> {
+    if token.is_empty() {
+        return Err(denied(StatusCode::UNAUTHORIZED, "sign in again"));
+    }
     c.query_row(
         "SELECT account,id,name FROM devices WHERE token=?",
         [digest(token.as_bytes())],
@@ -146,6 +150,8 @@ impl Store {
           CREATE TABLE IF NOT EXISTS releases(platform TEXT NOT NULL,generation INTEGER NOT NULL,sha256 TEXT NOT NULL,installer_hash TEXT NOT NULL,installer TEXT NOT NULL,manifest TEXT NOT NULL,PRIMARY KEY(platform,generation));
           CREATE INDEX IF NOT EXISTS published_binary ON releases(sha256);
           CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY,account TEXT NOT NULL,name TEXT NOT NULL,token TEXT NOT NULL UNIQUE);
+          CREATE TABLE IF NOT EXISTS device_signins(request TEXT PRIMARY KEY, secret_hash TEXT NOT NULL UNIQUE, code TEXT NOT NULL UNIQUE, device TEXT NOT NULL,
+            approver TEXT REFERENCES devices(id) ON DELETE CASCADE, expires INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS attempts(peer TEXT PRIMARY KEY, starts INTEGER NOT NULL,n INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS games(account TEXT,game TEXT,recipe TEXT NOT NULL,revision INTEGER NOT NULL,shared INTEGER NOT NULL,head INTEGER,
             generation INTEGER NOT NULL DEFAULT 0,holder TEXT,session TEXT,since INTEGER,expires INTEGER,PRIMARY KEY(account,game));
@@ -230,7 +236,7 @@ pub fn serve_controlled(
                 tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
             }
         });
-        let app = releases::routes().merge(Router::new()
+        let app = releases::routes().merge(device_codes::routes()).merge(Router::new()
             .route("/v1/login", post(login))
             .route("/v1/rpc", post(rpc))
             .route(
@@ -278,6 +284,24 @@ async fn login(
     database(move || sign_in(&s, peer, l).map(Json)).await
 }
 
+fn limit_attempts(connection: &Connection, bucket: &str, limit: i64) -> Result<()> {
+    let attempts: i64 = connection.query_row(
+        "INSERT INTO attempts VALUES(?1,?2,1)
+         ON CONFLICT(peer) DO UPDATE SET
+           n=CASE WHEN starts < ?2-60 THEN 1 ELSE n+1 END,
+           starts=CASE WHEN starts < ?2-60 THEN ?2 ELSE starts END RETURNING n",
+        params![bucket, now()],
+        |r| r.get(0),
+    )?;
+    if attempts > limit {
+        return Err(denied(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many sign-in attempts; retry in a minute",
+        ));
+    }
+    Ok(())
+}
+
 fn sign_in(store: &Store, peer: SocketAddr, login: Login) -> Result<String> {
     ensure!(
         key(&login.account)
@@ -287,20 +311,7 @@ fn sign_in(store: &Store, peer: SocketAddr, login: Login) -> Result<String> {
         "invalid sign-in fields"
     );
     let mut connection = store.connection()?;
-    let attempts: i64 = connection.query_row(
-        "INSERT INTO attempts VALUES(?1,?2,1)
-         ON CONFLICT(peer) DO UPDATE SET
-           n=CASE WHEN starts < ?2-60 THEN 1 ELSE n+1 END,
-           starts=CASE WHEN starts < ?2-60 THEN ?2 ELSE starts END RETURNING n",
-        params![peer.ip().to_string(), now()],
-        |r| r.get(0),
-    )?;
-    if attempts > 60 {
-        return Err(denied(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many sign-in attempts; retry in a minute",
-        ));
-    }
+    limit_attempts(&connection, &peer.ip().to_string(), 60)?;
     // Hash outside the write transaction so game heartbeats can run during registration.
     let registration = if let Some(invite) = &login.invite {
         ensure!(login.password.len() >= 8, "use at least eight characters");

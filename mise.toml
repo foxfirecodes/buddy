@@ -28,3 +28,24 @@ run = [
   "rustup target add x86_64-unknown-linux-gnu",
   "cargo zigbuild --locked --release -p buddy --target x86_64-unknown-linux-gnu.2.28",
 ]
+
+[tasks.stage]
+description = "Build the x86-64 Linux host and both clients into server-stage/"
+tools = { zig = "0.14.1", "cargo:cargo-zigbuild" = "0.24.1" }
+run = '''
+set -eu
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+linux=x86_64-unknown-linux-gnu
+windows=x86_64-pc-windows-gnullvm
+
+mise run build:linux
+rustup target add "$windows"
+cargo zigbuild --locked --release -p buddy --target "$windows"
+# Cargo uses the same output path for both Linux glibc targets.
+cargo zigbuild --locked --release -p buddy --target "$linux" --target-dir "$CARGO_TARGET_DIR/stage-host"
+
+mkdir -p server-stage
+install -m 755 "$CARGO_TARGET_DIR/stage-host/$linux/release/buddy" server-stage/buddy
+install -m 755 "$CARGO_TARGET_DIR/$linux/release/buddy" server-stage/buddy-linux-x86_64
+install -m 755 "$CARGO_TARGET_DIR/$windows/release/buddy.exe" server-stage/buddy-windows-x86_64.exe
+'''

@@ -23,14 +23,15 @@ Run `mise trust` once in your checkout. If your Rust toolchain is missing the ch
 | `mise run check` | Check formatting, run Clippy with warnings as errors, and test the workspace for the current platform. |
 | `mise run test:sync` | Build Buddy and exercise two-device sync against a disposable server on Linux. Requires Python 3. |
 | `mise run build:linux` | Build the portable x86-64 Linux and Steam Deck client targeting glibc 2.28. |
+| `mise run stage` | Cross-build the x86-64 Linux host, portable Linux/Deck client, and Windows client into `server-stage/` for copying to your server. |
 
 ## Install Buddy on another device
 
-On the server, publish the executable for each kind of client you use. For Steam Deck and Linux desktops, use the [portable Linux build](docs/sync.md#rebuild-for-another-platform).
+Run `mise run stage` on your Linux build machine, then copy `server-stage/` beside `server.toml` on your server. The staged `buddy` executable runs the host. From that settings directory, publish each client you use.
 
 ```sh
-buddy publish-release --config server.toml linux-x86_64 /path/to/portable/buddy
-buddy publish-release --config server.toml windows-x86_64 /path/to/buddy.exe
+./server-stage/buddy publish-release --config server.toml linux-x86_64 ./server-stage/buddy-linux-x86_64
+./server-stage/buddy publish-release --config server.toml windows-x86_64 ./server-stage/buddy-windows-x86_64.exe
 ```
 
 On a signed-in client, open **Settings → Pair a device**, choose the destination platform, and copy the command. Paste it into a shell on Linux or PowerShell on Windows. The command verifies and installs the build, links the device to your account, then offers **Add Buddy to Steam**. Anyone with the command can join your account once within ten minutes. With plain HTTP, use a trusted network, since the connection carries credentials.

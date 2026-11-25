@@ -45,6 +45,4 @@ cargo zigbuild --locked --release -p buddy --target "$windows"
 mkdir -p server-stage
 install -m 755 "$CARGO_TARGET_DIR/$linux/release/buddy" server-stage/buddy-linux-x86_64
 install -m 755 "$CARGO_TARGET_DIR/$windows/release/buddy.exe" server-stage/buddy-windows-x86_64.exe
-# Remove the separate Linux host binary left by older staging runs.
-rm -f -- server-stage/buddy
 '''

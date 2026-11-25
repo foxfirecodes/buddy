@@ -1,0 +1,69 @@
+[tools]
+rust = "stable"
+
+[vars]
+buddy = "cargo run --quiet --locked --release -p buddy --"
+# The Steam Deck launch probe reads Linux process and cgroup state.
+workspace = "--workspace{% if os() != 'linux' %} --exclude buddy-probe{% endif %}"
+
+[tasks.setup]
+description = "Install Rust development components and fetch locked dependencies"
+run = ["rustup component add rustfmt clippy", "cargo fetch --locked"]
+
+[tasks.build]
+description = "Build the native Buddy release binary"
+run = "cargo build --locked --release -p buddy"
+
+[tasks."build:linux"]
+description = "Build portable x86-64 Buddy for Linux desktops and Steam Deck (glibc 2.28)"
+tools = { zig = "0.14.1", "cargo:cargo-zigbuild" = "0.24.1" }
+run = [
+  "rustup target add x86_64-unknown-linux-gnu",
+  "cargo zigbuild --locked --release -p buddy --target x86_64-unknown-linux-gnu.2.28",
+]
+
+[tasks.install]
+description = "Install Buddy from this checkout into Cargo’s bin directory"
+run = "cargo install --locked --path buddy --bin buddy"
+
+[tasks.buddy]
+description = "Open the GUI, or pass a Buddy command such as tui, games, or status GAME"
+raw = true
+run = "{{vars.buddy}}"
+
+[tasks.fmt]
+description = "Format the Rust workspace"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Check formatting and run Clippy on every workspace target"
+run = ["cargo fmt --all -- --check", "cargo clippy --locked {{vars.workspace}} --all-targets -- -D warnings"]
+
+[tasks.test]
+description = "Run the Rust workspace tests"
+run = "cargo test --locked {{vars.workspace}}"
+
+[tasks.check]
+description = "Run formatting checks, Clippy, and the workspace tests"
+depends = ["lint", "test"]
+
+[tasks."test:sync"]
+description = "Exercise two-device sync against a disposable Linux server (requires Python 3)"
+depends = ["build"]
+run = 'python3 tests/sync.py "${CARGO_TARGET_DIR:-target}/release/buddy"'
+
+[tasks."server:init"]
+description = "Create server.toml in the checkout, preserving an existing file"
+run = "{{vars.buddy}} init-server"
+
+[tasks."server:serve"]
+description = "Run the headless server in the foreground (accepts --config PATH)"
+run = "{{vars.buddy}} serve"
+
+[tasks."server:invite"]
+description = "Create a single-use new-account invite (accepts --config PATH)"
+run = "{{vars.buddy}} invite"
+
+[tasks."server:publish"]
+description = "Sign and publish a client binary: PLATFORM BINARY [--config PATH]"
+run = "{{vars.buddy}} publish-release"

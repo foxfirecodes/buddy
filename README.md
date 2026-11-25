@@ -14,6 +14,26 @@ For headless hosting, run `buddy init-server` in the directory where you want to
 - [Phase design language](docs/design-language.md) describes Buddy’s visual style and links to the interactive reference.
 - [Run the Steam Deck launch probe](#buddy-launch-probe) to measure when Game Mode lets post-game work finish. This is a separate executable and experiment.
 
+## Working from a checkout with mise
+
+Run `mise trust` once, then `mise run setup` to prepare Rust. `mise tasks` lists the available tasks.
+
+| Task | Use it for |
+| --- | --- |
+| `mise run build` | Build the native release, including on Windows with the MSVC build tools installed. |
+| `mise run install` | Install the native Buddy executable into Cargo’s bin directory. Pass `--root DIR` to install into `DIR/bin`. |
+| `mise run buddy` | Open the GUI. Add `tui` for the terminal UI, or pass a CLI command such as `status steam-105600`. |
+| `mise run check` | Check formatting, run Clippy, and run the Rust tests. Use `mise run test:sync` for a disposable two-device sync test on Linux. |
+| `mise run build:linux` | Build the portable x86-64 Linux and Deck client using Zig. |
+
+For a local server, run `mise run server:init`, edit `server.toml`, then run `mise run server:serve`. Use `mise run server:invite` in a second terminal to create an account invite. Once `build:linux` finishes, publish the portable client for other devices with this command.
+
+```sh
+mise run server:publish linux-x86_64 target/x86_64-unknown-linux-gnu/release/buddy
+```
+
+The server tasks use the checkout’s `server.toml` by default. Pass `--config PATH` to `server:serve`, `server:invite`, or `server:publish` to operate on another host configuration.
+
 ## Install Buddy on another device
 
 On the server, publish the executable for each kind of client you use. For Steam Deck and Linux desktops, use the [portable Linux build](docs/sync.md#rebuild-for-another-platform).

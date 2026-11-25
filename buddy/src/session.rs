@@ -1,5 +1,5 @@
 use crate::{
-    files::{Cache, Files, Restore},
+    files::{Cache, Files, Restore, SaveLocation},
     local::{Api, Local, Pending, Setup, unreachable},
     model::*,
 };
@@ -36,6 +36,28 @@ impl Interface {
             }
             Self::Window => crate::ui::choose(title, message, options),
         }
+    }
+
+    fn recover_after_game(
+        self,
+        title: &str,
+        message: &str,
+        retry: Option<&str>,
+        error: anyhow::Error,
+    ) -> Result<()> {
+        let options: &[&str] = match retry {
+            Some(action) => &["Later", action],
+            None => &["Close"],
+        };
+        let choice = match self {
+            Self::Window => {
+                crate::ui::choose_with_details(title, message, options, &format!("{error:#}"))?
+            }
+            Self::Terminal => self.choose(title, &format!("{message}\n\n{error:#}"), options)?,
+            Self::Unattended => return Err(error.context(format!("{title}. {message}"))),
+        };
+        ensure!(choice == 1, crate::ui::Cancelled);
+        Ok(())
     }
 }
 struct Heartbeat {
@@ -80,7 +102,7 @@ struct Online<'a> {
     scope: Recipe,
 }
 impl Online<'_> {
-    fn commit(&mut self, tree: &Tree, close: bool) -> Result<i64> {
+    fn commit(&mut self, tree: &Tree, close: bool, operation: String) -> Result<i64> {
         let progress =
             crate::ui::Progress::start(self.ui, &self.scope.title, "Checking missing chunks…");
         self.api
@@ -96,7 +118,7 @@ impl Online<'_> {
             expected: self.head.as_ref().map(|r| r.id),
             tree: full.clone(),
             close,
-            op: id(),
+            op: operation,
         };
         let id = self.api.rpc::<i64>(op)?;
         if self.head.as_ref().is_none_or(|r| r.id != id) {
@@ -109,9 +131,79 @@ impl Online<'_> {
         }
         Ok(id)
     }
+
+    fn preserve_displaced_session(&self, pending: &Pending) -> Result<i64> {
+        let progress =
+            crate::ui::Progress::start(self.ui, &self.scope.title, "Preserving this session…");
+        self.api
+            .upload(self.cache, &pending.tree, |d, t| progress.uploaded(d, t))?;
+        self.api.rpc(Action::Preserve {
+            game: self.scope.game.clone(),
+            slots: self.scope.slots.keys().cloned().collect(),
+            local: pending.tree.clone(),
+            time: pending.time,
+            op: pending.op.clone(),
+        })
+    }
+
+    fn publish_after_game(&mut self, setup: &Setup) -> Result<()> {
+        let tree = setup.base.as_ref().context("missing captured state")?;
+        // A missing response can mean this commit already closed the lease.
+        let operation = id();
+        loop {
+            let mut error = match self.commit(tree, true, operation.clone()) {
+                Ok(_) => return Ok(()),
+                Err(error) => error,
+            };
+            if error
+                .downcast_ref::<crate::local::ApiError>()
+                .is_some_and(|e| e.0 == 412)
+            {
+                let Some(pending) = setup.pending.last() else {
+                    return Ok(());
+                };
+                // Preserve the captured bytes without disturbing the current lease.
+                match self.preserve_displaced_session(pending) {
+                    Ok(_) => return self.ui.recover_after_game(
+                        "Session saved as a backup",
+                        "The server session changed. Your save has a permanent server backup and is queued on this device for reconciliation at the next sync.",
+                        None,
+                        error,
+                    ),
+                    Err(failure) => error = failure,
+                }
+            }
+            let queued = !setup.pending.is_empty();
+            let title = if queued {
+                "Save queued on this device"
+            } else {
+                "Couldn’t close the sync session"
+            };
+            let status = error.downcast_ref::<crate::local::ApiError>().map(|e| e.0);
+            if status == Some(401) {
+                return self.ui.recover_after_game(
+                    title,
+                    "Sign in to this account again in Buddy, then choose Sync now for this game.",
+                    None,
+                    error,
+                );
+            }
+            let message = if status == Some(507) {
+                "The server is out of storage for this account. Free space or increase the account quota, then retry sync."
+            } else if queued && unreachable(&error) {
+                "Buddy couldn’t reach the server. Reconnect and retry, or leave this save for the next sync."
+            } else if queued {
+                "Sync didn’t finish. Retry now, or leave your saved changes queued for the next sync."
+            } else {
+                "The game files are unchanged. Retry to finish closing the session, or leave it for the next sync."
+            };
+            self.ui
+                .recover_after_game(title, message, Some("Retry sync"), error)?;
+        }
+    }
     fn merge(&mut self, tree: &Tree, base: Option<&Tree>, time: i64) -> Result<Tree> {
         let Some(remote) = self.head.clone() else {
-            self.commit(tree, false)?;
+            self.commit(tree, false, id())?;
             return Ok(tree.clone());
         };
         let remote_tree = remote.tree.project(&self.scope);
@@ -119,7 +211,7 @@ impl Online<'_> {
             return Ok(remote_tree);
         }
         if base == Some(&remote_tree) || base.is_none() && !remote_tree.populated() {
-            self.commit(tree, false)?;
+            self.commit(tree, false, id())?;
             return Ok(tree.clone());
         }
         let progress =
@@ -174,11 +266,12 @@ impl Online<'_> {
         };
         match picked {
             0 => {
-                self.commit(tree, false)?;
+                self.commit(tree, false, id())?;
                 Ok(tree.clone())
             }
             1 => Ok(remote_tree),
-            _ => bail!("both backups preserved; decision pending"),
+            _ => Err(anyhow::Error::new(crate::ui::Cancelled)
+                .context("both backups preserved; decision pending")),
         }
     }
 }
@@ -196,49 +289,104 @@ fn execute(command: &[OsString], manual: bool, ui: Interface, started: &mut bool
     } else {
         buddy_process::wait_for_game(child, || *started = true).context("launch or observe game")?
     };
-    if manual {
-        ensure!(
-            ui.choose(
+    #[cfg(unix)]
+    let code = {
+        use std::os::unix::process::ExitStatusExt;
+        status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+    };
+    #[cfg(not(unix))]
+    let code = status.code().unwrap_or(1);
+    if manual
+        && ui
+            .choose(
                 "Finish session",
                 "Close the game and any launcher that can still write its saves.",
-                &["Game is closed", "Leave pending"]
-            )? == 0,
-            "session left pending"
-        );
-    }
-    #[cfg(unix)]
+                &["Game is closed", "Leave pending"],
+            )
+            .context(PostGame(code))?
+            != 0
     {
-        use std::os::unix::process::ExitStatusExt;
-        Ok(status
-            .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
+        return Err(anyhow::Error::new(crate::ui::Cancelled)
+            .context("session left pending")
+            .context(PostGame(code)));
     }
-    #[cfg(not(unix))]
-    {
-        Ok(status.code().unwrap_or(1))
-    }
+    Ok(code)
 }
 fn finish_local(
     clean_exit: bool,
     local: &Local,
     c: &Credentials,
     s: &mut Setup,
-    files: &Files,
+    scope: &Recipe,
     cache: &Cache,
 ) -> Result<()> {
+    let files = Files::open(scope, &s.bindings, &local.home)?;
     let tree = files.scan(&s.recipe, cache, None, clean_exit)?;
-    if s.active_base.as_ref() != Some(&tree) {
+    let mut active_base = s.active_base.take();
+    let changed = active_base.as_ref() != Some(&tree);
+    if changed {
         s.pending.push(Pending {
             tree: tree.clone(),
-            base: s.active_base.clone(),
+            base: active_base.take(),
             time: now(),
             op: id(),
         });
     }
-    s.base = Some(tree);
+    let previous_base = s.base.replace(tree);
     s.active = false;
-    s.active_base = None;
-    local.save(c, s)
+    if let Err(error) = local.save(c, s) {
+        // A retry must start from the same active session as the durable record.
+        s.base = previous_base;
+        if changed {
+            active_base = s.pending.pop().expect("just queued this capture").base;
+        }
+        s.active_base = active_base;
+        s.active = true;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn capture_after_game(
+    local: &Local,
+    c: &Credentials,
+    s: &mut Setup,
+    scope: &Recipe,
+    cache: &Cache,
+    ui: Interface,
+) -> Result<()> {
+    loop {
+        let progress = crate::ui::Progress::start(ui, &s.recipe.title, "Capturing changed files…");
+        let result = finish_local(true, local, c, s, scope, cache);
+        drop(progress);
+        let Err(error) = result else { return Ok(()) };
+        let full = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
+                || cause
+                    .downcast_ref::<rusqlite::Error>()
+                    .is_some_and(|e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull))
+        });
+        let message = if full {
+            format!(
+                "Free space on the drive containing Buddy’s data folder, then retry capture.\n\n{}",
+                local.home.display()
+            )
+        } else if let Some(location) = error.downcast_ref::<SaveLocation>() {
+            location.to_string()
+        } else {
+            "Check your save files and Buddy’s data folder, then retry capture. Choosing Later leaves the session open for recovery.".into()
+        };
+        ui.recover_after_game(
+            "Couldn’t capture game saves",
+            &message,
+            Some("Retry capture"),
+            error,
+        )?;
+    }
 }
 fn recover_local(
     local: &Local,
@@ -264,10 +412,9 @@ fn recover_local(
                 "Confirm the previous game is fully closed before capturing its surviving files.",
                 &["Cancel", "Game is closed"]
             )? == 1,
-            "cancelled"
+            crate::ui::Cancelled
         );
-        let files = Files::open(scope, &s.bindings, &local.home)?;
-        finish_local(false, local, c, s, &files, cache)?;
+        finish_local(false, local, c, s, scope, cache)?;
     }
     Ok(())
 }
@@ -296,10 +443,10 @@ fn acquire(api: &Api, s: &Setup, ui: Interface) -> Result<Acquisition> {
                 )? {
                     0 => thread::sleep(Duration::from_secs(2)),
                     1 => {
-                        ensure!(ui.choose("Confirm takeover",&format!("{} may still be playing. Its next save will need reconciliation.",held.device),&["Cancel","Confirm takeover"])?==1,"cancelled");
+                        ensure!(ui.choose("Confirm takeover",&format!("{} may still be playing. Its next save will need reconciliation.",held.device),&["Cancel","Confirm takeover"])?==1,crate::ui::Cancelled);
                         takeover = Some(held.generation);
                     }
-                    _ => bail!("cancelled"),
+                    _ => bail!(crate::ui::Cancelled),
                 }
             }
         }
@@ -416,6 +563,7 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
                         recover_local(local, &c, &mut s, &scope, &cache, ui)?;
                         let files = Files::open(&scope, &s.bindings, &local.home)?;
                         let before = files.capture(&s.recipe, &cache, None)?;
+                        drop(files);
                         if !before.populated() && s.base.as_ref().is_none_or(Tree::populated) {
                             ensure!(
                                 ui.choose(
@@ -423,7 +571,7 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
                                     "This device has no saved progress in the selected paths.",
                                     &["Cancel", "Start a new game"]
                                 )? == 1,
-                                "cancelled"
+                                crate::ui::Cancelled
                             );
                         }
                         s.active = true;
@@ -443,16 +591,11 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
                                 return Err(error);
                             }
                         };
-                        let _capture = crate::ui::Progress::start(
-                            ui,
-                            &s.recipe.title,
-                            "Preserving offline progress…",
-                        );
-                        finish_local(true, local, &c, &mut s, &files, &cache)
+                        capture_after_game(local, &c, &mut s, &scope, &cache, ui)
                             .context(PostGame(code))?;
                         return Ok(code);
                     }
-                    _ => bail!("cancelled"),
+                    _ => bail!(crate::ui::Cancelled),
                 }
             }
             Err(e) => return Err(e),
@@ -561,7 +704,7 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
                     ),
                     &["Cancel", "Restore"]
                 )? == 1,
-                "cancelled"
+                crate::ui::Cancelled
             );
         }
         let mut online = Online {
@@ -617,7 +760,7 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
                 p.status("Verifying game files…");
             }
             if restoring_backup {
-                online.commit(&next, false)?;
+                online.commit(&next, false, id())?;
             }
         }
         if next != live {
@@ -653,6 +796,7 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
         api.rpc::<()>(Action::Renew {
             lease: lease.clone(),
         })?;
+        drop(files);
         drop(progress.take());
         s.active = true;
         s.active_base = Some(next);
@@ -670,31 +814,8 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
             }
         };
         completed_code = Some(code);
-        {
-            let _progress =
-                crate::ui::Progress::start(ui, &s.recipe.title, "Capturing changed files…");
-            finish_local(true, local, &c, &mut s, &files, &cache)?;
-        }
-        let tree = s.base.clone().context("missing captured state")?;
-        if let Err(e) = online.commit(&tree, true) {
-            if e.downcast_ref::<crate::local::ApiError>()
-                .is_some_and(|e| e.0 == 412)
-                && let Some(p) = s.pending.last()
-            {
-                // The other player keeps the lease. Both versions become durable backups immediately.
-                let progress =
-                    crate::ui::Progress::start(ui, &s.recipe.title, "Preserving this session…");
-                api.upload(&cache, &p.tree, |d, t| progress.uploaded(d, t))?;
-                api.rpc::<i64>(Action::Preserve {
-                    game: g.into(),
-                    slots: scope.slots.keys().cloned().collect(),
-                    local: p.tree.clone(),
-                    time: p.time,
-                    op: p.op.clone(),
-                })?;
-            }
-            return Err(e);
-        }
+        capture_after_game(local, &c, &mut s, &scope, &cache, ui)?;
+        online.publish_after_game(&s)?;
         s.pending.clear();
         Ok(code)
     })();
@@ -702,7 +823,17 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
     let finalized = (|| match result {
         Ok(code) => {
             s.session = None;
-            local.save(&c, &s)?;
+            while let Err(error) = local.save(&c, &s) {
+                if completed_code.is_none() {
+                    return Err(error);
+                }
+                ui.recover_after_game(
+                    "Couldn’t update local sync status",
+                    "This session has no changes left to upload. Retry saving Buddy’s sync status or choose Sync now later.",
+                    Some("Retry saving status"),
+                    error,
+                )?;
+            }
             Ok(code)
         }
         Err(e) => {
@@ -717,5 +848,64 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
         finalized.context(PostGame(code))
     } else {
         finalized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::files::Binding;
+    use std::fs;
+
+    #[test]
+    fn failed_local_capture_commit_can_be_retried_once() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let local = Local::open(Some(temp.path().join("profile")))?;
+        let creds = Credentials {
+            url: "http://localhost".into(),
+            account: "player".into(),
+            device: "test".into(),
+            token: "test".into(),
+            paired_ca: None,
+        };
+        let recipe: Recipe = serde_json::from_value(serde_json::json!({
+            "game": "sample", "title": "Sample", "retention": 3, "slots": {"save": {"kind":"File"}}
+        }))?;
+        let mut setup = Setup::new(GameInfo {
+            recipe: recipe.clone(),
+            revision: 1,
+            shared: false,
+            retired_slots: Default::default(),
+        });
+        let path = temp.path().join("save.dat");
+        fs::write(&path, "before")?;
+        setup
+            .bindings
+            .insert("save".into(), Binding::new(&path, &Kind::File)?);
+        let cache = local.cache(&creds)?;
+        let before =
+            Files::open(&recipe, &setup.bindings, &local.home)?.capture(&recipe, &cache, None)?;
+        setup.base = Some(before.clone());
+        setup.active_base = Some(before.clone());
+        setup.active = true;
+        local.save(&creds, &setup)?;
+        fs::write(path, "after")?;
+
+        let db = rusqlite::Connection::open(local.home.join("client.sqlite3"))?;
+        db.execute_batch("CREATE TRIGGER refuse_capture BEFORE UPDATE ON state BEGIN SELECT RAISE(ABORT, 'test write failure'); END")?;
+        assert!(finish_local(true, &local, &creds, &mut setup, &recipe, &cache).is_err());
+        for state in [&setup, &local.setup(&creds, "sample")?] {
+            assert!(state.active && state.pending.is_empty());
+            assert_eq!(state.active_base.as_ref(), Some(&before));
+            assert_eq!(state.base.as_ref(), Some(&before));
+        }
+        db.execute_batch("DROP TRIGGER refuse_capture")?;
+        finish_local(true, &local, &creds, &mut setup, &recipe, &cache)?;
+        let captured = local.setup(&creds, "sample")?;
+        assert!(!captured.active && captured.active_base.is_none());
+        assert_eq!(captured.pending.len(), 1);
+        assert_eq!(captured.pending[0].base.as_ref(), Some(&before));
+        assert_eq!(captured.base.as_ref(), Some(&captured.pending[0].tree));
+        Ok(())
     }
 }

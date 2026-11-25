@@ -21,8 +21,8 @@ mod desktop;
 pub(crate) use desktop::{finish_install, list_profiles, steam};
 mod dialogs;
 pub(crate) use crate::phase::style;
+pub(crate) use dialogs::{Cancelled, SaveCopy, choose_conflict, choose_with_details};
 pub use dialogs::{Progress, choose, decision_window, progress_window};
-pub(crate) use dialogs::{SaveCopy, choose_conflict};
 
 pub(crate) fn native(size: [f32; 2]) -> eframe::NativeOptions {
     eframe::NativeOptions {
@@ -70,11 +70,11 @@ enum GamePage {
     Settings,
 }
 enum Event {
-    Signed,
-    ChooseCredentialStorage(Credentials),
+    Signed(Credentials),
+    Onboarding(JoinStep),
     Catalog(String),
     Bound,
-    ReviewStaged(String),
+    ReviewStaged(anyhow::Error),
     Games(Vec<Row>),
     Detail(Box<Detail>),
     Done(String),
@@ -82,7 +82,7 @@ enum Event {
     ReleaseDialog(desktop::ReleaseDialog),
     Restarted,
 }
-type Reply = Result<Event, String>;
+type Reply = Result<Event>;
 struct App {
     local: Local,
     rx: mpsc::Receiver<Reply>,
@@ -112,7 +112,7 @@ struct App {
     launcher_args: String,
     detail: Option<Detail>,
     note: String,
-    error: bool,
+    error: Option<String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum LibraryFilter {
@@ -137,6 +137,33 @@ fn phase_heading(ui: &mut egui::Ui, title: &str) {
             .strong()
             .color(phase::TEXT),
     );
+}
+
+pub(crate) fn error_summary(error: &anyhow::Error) -> String {
+    // A caller's context explains which operation failed. Translate bare transport
+    // errors only when there is no more specific instruction from that operation.
+    let cause: &(dyn std::error::Error + 'static) = error.as_ref();
+    if let Some(server) = cause.downcast_ref::<crate::local::ApiError>() {
+        return server.1.clone();
+    }
+    if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
+        if crate::local::unreachable(error) {
+            return "Couldn’t reach the server. Check the connection and try again.".into();
+        }
+        if http.is_connect() {
+            return "Couldn’t connect. Check the server address and its HTTPS certificate if you use one.".into();
+        }
+    }
+    error.to_string()
+}
+
+pub(crate) fn show_problem(ui: &mut egui::Ui, error: &anyhow::Error) {
+    let summary = error_summary(error);
+    ui.colored_label(ui.visuals().error_fg_color, &summary);
+    let details = format!("{error:#}");
+    if details != summary {
+        ui.collapsing("Details", |ui| ui.monospace(details));
+    }
 }
 
 fn cover_title(ui: &egui::Ui, rect: egui::Rect, title: &str, y: f32, size: f32) {
@@ -207,28 +234,22 @@ fn game_tile(
 impl App {
     fn new(local: Local, offer_steam: bool) -> Self {
         let (tx, rx) = mpsc::channel();
-        let c = local.credentials().ok();
-        let signed = c.is_some();
-        let pairing = c.as_ref().and_then(crate::host::Pairing::remembered);
         let mut app = Self {
             local,
             tx,
             rx,
             busy: false,
-            signed,
+            signed: false,
             offer_steam,
             release_dialog: None,
-            join_step: JoinStep::Welcome,
-            url: c
-                .as_ref()
-                .map(|c| c.url.clone())
-                .unwrap_or_else(|| "http://127.0.0.1:7341".into()),
-            account: c.as_ref().map(|c| c.account.clone()).unwrap_or_default(),
+            join_step: JoinStep::Opening,
+            url: "http://127.0.0.1:7341".into(),
+            account: String::new(),
             password: String::new(),
-            device: c.map(|c| c.device).unwrap_or_else(default_device),
+            device: default_device(),
             invite: String::new(),
             register: false,
-            pairing,
+            pairing: None,
             private_file: false,
             games: vec![],
             filter: String::new(),
@@ -242,11 +263,9 @@ impl App {
             launcher_args: String::new(),
             detail: None,
             note: String::new(),
-            error: false,
+            error: None,
         };
-        if signed {
-            app.refresh();
-        }
+        app.open_profile();
         app
     }
     fn job(&mut self, f: impl FnOnce(Local) -> Result<Event> + Send + 'static) {
@@ -254,13 +273,17 @@ impl App {
             return;
         }
         self.busy = true;
-        self.error = false;
+        self.error = None;
         self.note.clear();
         let tx = self.tx.clone();
         let local = self.local.clone();
         thread::spawn(move || {
-            let _ = tx.send(f(local).map_err(|e| format!("{e:#}")));
+            let _ = tx.send(f(local));
         });
+    }
+    fn show_error(&mut self, error: anyhow::Error) {
+        self.note = error_summary(&error);
+        self.error = Some(format!("{error:#}"));
     }
     fn refresh(&mut self) {
         self.job(|l| Ok(Event::Games(setup::games(&l)?)));
@@ -363,6 +386,7 @@ impl App {
         self.review = None;
         self.detail = None;
         self.note.clear();
+        self.error = None;
         self.page = GamePage::Overview;
     }
     fn select(&mut self, game: String, title: String) {
@@ -472,6 +496,7 @@ impl App {
                 if ui.button("Copy launch options").clicked() {
                     ui.ctx().copy_text(f.options);
                     self.note = "Steam launch options copied".into();
+                    self.error = None;
                 }
             }
             Ok(f) => {
@@ -562,7 +587,7 @@ impl App {
                     let base = d.baseline.clone();
                     self.job(move |local| {
                         let message = format!("Remove {slot} from the recipe for all devices? Local files stay on disk. Unsaved setup edits will be discarded.");
-                        ensure!(choose("Remove from recipe", &message, &["Cancel", "Remove"])? == 1, "cancelled");
+                        ensure!(choose("Remove from recipe", &message, &["Cancel", "Remove"])? == 1, Cancelled);
                         setup::remove_slot(&local, &base, &slot)?;
                         Ok(Event::Done("Location removed from recipe".into()))
                     });
@@ -590,7 +615,7 @@ impl App {
                         );
                         ensure!(
                             choose(title, &message, &["Cancel", "Save setup"])? == 1,
-                            "cancelled"
+                            Cancelled
                         );
                     }
                     if let Err(error) = setup::save_review(&local, &base, changes) {
@@ -600,7 +625,7 @@ impl App {
                                 .maybe_setup(&credentials, &game)?
                                 .is_some_and(|s| s.draft.is_some())
                         {
-                            return Ok(Event::ReviewStaged(format!("{error:#}")));
+                            return Ok(Event::ReviewStaged(error));
                         }
                         return Err(error);
                     }
@@ -635,7 +660,7 @@ impl App {
                                 "Remove the pending edits on this device?",
                                 &["Cancel", "Discard edits"]
                             )? == 1,
-                            "cancelled"
+                            Cancelled
                         );
                         setup::review(&l, &g, Interface::Window, true)?;
                         Ok(Event::Done("Recipe edits discarded".into()))
@@ -879,7 +904,7 @@ impl App {
                 );
                 ensure!(
                     choose("Remove permanent pin", &message, &["Cancel", "Remove pin"])? == 1,
-                    "cancelled"
+                    Cancelled
                 );
             }
             if let Action::Delete { id, .. } = &a {
@@ -889,7 +914,7 @@ impl App {
                         &format!("Delete backup #{id}?"),
                         &["Cancel", "Delete backup"]
                     )? == 1,
-                    "cancelled"
+                    Cancelled
                 );
             }
             Api::new(credentials)?.rpc::<()>(a)?;
@@ -907,16 +932,22 @@ impl eframe::App for App {
         if let Ok(event) = self.rx.try_recv() {
             self.busy = false;
             match event {
-                Ok(Event::Signed) => {
-                    self.join_step = JoinStep::Account;
+                Ok(Event::Signed(credentials)) => {
+                    self.remember_profile(&credentials);
+                    self.join_step = JoinStep::Welcome;
                     self.signed = true;
                     self.refresh();
                 }
-                Ok(Event::ChooseCredentialStorage(credentials)) => {
-                    if matches!(self.join_step, JoinStep::Storage(_)) {
+                Ok(Event::Onboarding(step)) => {
+                    if let JoinStep::SavedSignIn(record, _) = &step {
+                        self.remember_profile(record);
+                    }
+                    if matches!(self.join_step, JoinStep::Storage { .. })
+                        && matches!(step, JoinStep::Storage { .. })
+                    {
                         self.note = "The credential store is still unavailable.".into();
                     }
-                    self.join_step = JoinStep::Storage(credentials);
+                    self.join_step = step;
                 }
                 Ok(Event::Games(g)) => self.games = g,
                 Ok(Event::Catalog(msg)) => {
@@ -959,21 +990,22 @@ impl eframe::App for App {
                 Ok(Event::Done(s)) => {
                     self.finished(s);
                 }
-                Ok(Event::ReviewStaged(message)) => {
+                Ok(Event::ReviewStaged(error)) => {
                     self.page = GamePage::Overview;
                     self.review = None;
-                    self.finished(format!("Setup queued on this device. {message}"));
-                    self.error = true;
+                    self.finished(format!(
+                        "Setup edits are queued on this device. {}",
+                        error_summary(&error)
+                    ));
+                    self.error = Some(format!("{error:#}"));
                 }
                 Ok(Event::Bound) => {
                     self.page = GamePage::Overview;
                     self.review = None;
                     self.finished("Setup saved".into());
                 }
-                Err(e) => {
-                    self.note = e;
-                    self.error = true;
-                }
+                Err(e) if e.is::<Cancelled>() => {}
+                Err(e) => self.show_error(e),
             }
         }
         egui::TopBottomPanel::top("top")
@@ -1093,13 +1125,22 @@ impl eframe::App for App {
                         if self.busy {
                             ui.spinner();
                         }
-                        let color = if self.error {
+                        let color = if self.error.is_some() {
                             ui.visuals().error_fg_color
                         } else {
                             phase::TEXT
                         };
                         ui.colored_label(color, &self.note);
                     });
+                    if let Some(details) = &self.error
+                        && details != &self.note
+                    {
+                        ui.collapsing("Details", |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(100.)
+                                .show(ui, |ui| ui.monospace(details));
+                        });
+                    }
                 });
         }
         let margin = if ctx.screen_rect().width() < 700. {
@@ -1190,10 +1231,19 @@ pub fn tui(l: &Local) -> Result<()> {
             let device = Text::new("Device")
                 .with_default(&default_device())
                 .prompt()?;
-            let private_file =
+            let private_file = if onboarding::secret_service_absent() {
+                if !Confirm::new("Save this device’s token in Buddy’s private app data?")
+                    .with_default(false)
+                    .prompt()?
+                {
+                    continue;
+                }
+                true
+            } else {
                 Confirm::new("Store token in a private file instead of the OS credential store?")
                     .with_default(false)
-                    .prompt()?;
+                    .prompt()?
+            };
             l.set_login(
                 &Api::login_paired(
                     &url,

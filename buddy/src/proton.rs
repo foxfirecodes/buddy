@@ -84,7 +84,7 @@ impl Launch {
                     &msg,
                     &["Cancel", "Initialize prefix"]
                 )? == 1,
-                "Proton setup cancelled"
+                crate::ui::Cancelled
             );
             if !self.compat.exists() {
                 fs::create_dir(&self.compat)
@@ -275,7 +275,7 @@ pub fn first_launch(
             &msg,
             &["Cancel", "Use these locations"]
         )? == 1,
-        "setup cancelled; pick your own locations in Buddy"
+        crate::ui::Cancelled
     );
     for (id, dest) in selected {
         setup.bindings.insert(id, dest.bind()?);

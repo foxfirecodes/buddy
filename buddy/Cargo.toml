@@ -37,7 +37,7 @@ serde_json = "1"
 steamlocate = "2.1"
 keyvalues-parser = "0.2"
 tempfile = "3"
-tokio = { version = "1", features = ["macros","rt-multi-thread","net"] }
+tokio = { version = "1", features = ["macros","rt-multi-thread","net","time"] }
 toml = "0.9"
 unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4"] }
@@ -47,6 +47,7 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "async-
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1", features = ["fs"] }
+zbus = "4.4"
 
 [target.'cfg(windows)'.dependencies]
 self-replace = "1.5.1"

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from contextlib import contextmanager
 
 binary = str(Path(sys.argv[1]).resolve(strict=True))
 root = Path(sys.argv[2]).resolve(strict=True)
@@ -27,8 +28,10 @@ def call(profile, *argv, data=None):
 
 
 def window(title, action):
+    # xdotool searches legacy WM_NAME, where X11 can encode a typographic apostrophe as several characters.
+    pattern = "".join(re.escape(char) if char.isascii() else ".+" for char in title)
     wid = subprocess.check_output(["timeout","25","xdotool","search","--sync","--onlyvisible","--name",
-                                   "^"+re.escape(title)+"$"], text=True).splitlines()[-1]
+                                   "^"+pattern+"$"], text=True).splitlines()[-1]
     subprocess.run(["xdotool","windowactivate","--sync",wid],timeout=5,check=True)
     time.sleep(0.3)
     subprocess.run(["import","-window",wid,str(root/(title+".png"))], check=True, timeout=6)
@@ -117,12 +120,10 @@ else:
         return subprocess.Popen(command, env=dict(steam("B",compat),BUDDY_PASSWORD="test",BUDDY_INVITE="test"))
     proc = play()
     window("Set up the Proton prefix", ["Return"])
-    window("Buddy needs attention", ["Return"])
     assert proc.wait(timeout=10) != 0 and not compat.exists()
     proc = play()
     window("Set up the Proton prefix", ["Right","Return"])
     window("Confirm Proton save locations", ["Return"])
-    window("Buddy needs attention", ["Return"])
     assert proc.wait(timeout=10) != 0 and not (compat/"pfx"/rel).exists()
     proc = play()
     window("Confirm Proton save locations", ["Right","Return"])
@@ -134,6 +135,117 @@ else:
     assert proc.wait(timeout=10) != 0 and not (compat/"pfx/first-game-entry").exists()
     assert "saves:" not in call("B", "status", app)
     print("PASS first Proton enrollment respects cancellation, restores before launch and preserves explicit unbind", flush=True)
+
+
+@contextmanager
+def game_ready_to_exit(folder, game, label, *, change=True):
+    launches = root / (label + "-launches")
+    finish = root / (label + "-finish")
+    script = """
+import sys, time
+from pathlib import Path
+save, launches, finish = map(Path, sys.argv[1:4])
+if len(sys.argv) > 4:
+    save.write_text(sys.argv[4])
+with launches.open("a") as f:
+    f.write("launched\\n")
+while not finish.exists():
+    time.sleep(.02)
+sys.exit(23)
+"""
+    proc = subprocess.Popen(
+        [binary, "run", "--game", game, "--", sys.executable, "-c", script,
+         folder / "save", launches, finish, *([label] if change else [])], env=args("A"),
+    )
+    try:
+        deadline = time.monotonic() + 15
+        while not launches.exists() and time.monotonic() < deadline:
+            assert proc.poll() is None, "Buddy exited before launching the game"
+            time.sleep(.03)
+        assert launches.exists(), "game did not reach its save"
+        yield finish
+        assert proc.wait(timeout=15) == 23, "Buddy lost the game's exit code"
+        assert launches.read_text().splitlines() == ["launched"], "recovery relaunched the game"
+    finally:
+        finish.touch()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def post_game_recovery(config):
+    game = "exit-trial"
+    saves, remote = root / "exit-saves", root / "exit-other-device"
+    saves.mkdir()
+    remote.mkdir()
+    (saves / "save").write_text("initial")
+    server, _ = start(config)
+    try:
+        for name, folder in [("A", saves), ("B", remote)]:
+            call(name, "setup", game, folder)
+            call(name, "sync", game)
+        for action in ["later", "retry"]:
+            detached = root / "detached-drive"
+            label = "disconnected-drive-" + action
+            with game_ready_to_exit(saves, game, label) as finish:
+                saves.rename(detached)
+                finish.touch()
+                window("Couldn’t capture game saves", None)
+                status = call("A", "status", game)
+                assert "0 queued" in status and "session open=true" in status, status
+                if action == "retry":
+                    detached.rename(saves)
+                    window("Couldn’t capture game saves", ["Right", "Return"])
+                else:
+                    window("Couldn’t capture game saves", ["Return"])
+            if action == "later":
+                assert "session open=true" in call("A", "status", game)
+                detached.rename(saves)
+                proc = subprocess.Popen([binary, "run", "--game", game, "--", "true"], env=args("A"))
+                try:
+                    window("Recover interrupted session", ["Right", "Return"])
+                    assert proc.wait(timeout=10) == 0
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+            call("B", "sync", game)
+            assert (remote / "save").read_text() == label
+        for action in ["later", "retry"]:
+            label = "interrupted-upload-" + action
+            with game_ready_to_exit(saves, game, label) as finish:
+                server.terminate()
+                server.wait(timeout=8)
+                finish.touch()
+                window("Save queued on this device", None)
+                status = call("A", "status", game)
+                assert "1 queued" in status and "session open=false" in status, status
+                if action == "retry":
+                    server, _ = start(config)
+                    window("Save queued on this device", ["Right", "Return"])
+                else:
+                    window("Save queued on this device", ["Return"])
+            if action == "later":
+                assert "1 queued" in call("A", "status", game)
+                server, _ = start(config)
+                call("A", "sync", game)
+            assert "0 queued" in call("A", "status", game)
+            call("B", "sync", game)
+            assert (remote / "save").read_text() == label
+        history = call("A", "backups", game)
+        with game_ready_to_exit(saves, game, "unchanged-session", change=False) as finish:
+            server.terminate()
+            server.wait(timeout=8)
+            finish.touch()
+            window("Couldn’t close the sync session", None)
+            assert "0 queued" in call("A", "status", game)
+            server, _ = start(config)
+            window("Couldn’t close the sync session", ["Right", "Return"])
+        assert call("A", "backups", game) == history
+    finally:
+        server.terminate()
+        server.wait(timeout=8)
+    print("PASS post-game capture retry, queued upload retry and later, exit code and single launch", flush=True)
 
 
 def run():
@@ -210,7 +322,7 @@ def run():
             busy=rpc(url,token,"acquire",game="world",session="late",takeover=None)["Busy"]
             newer=rpc(url,token,"acquire",game="world",session="late",takeover=busy["generation"])["Granted"]
             gate.touch()
-            window("Buddy needs attention",["Return"])
+            window("Session saved as a backup",["Return"])
             assert late.wait(timeout=10)==23
             assert "1 queued" in call("A","status","world")
             assert "late save from A" == (a/"save").read_text()
@@ -224,6 +336,7 @@ def run():
         first_proton_play()
     finally:
         server.terminate();server.wait(timeout=8)
+    post_game_recovery(config)
 
 
 run()

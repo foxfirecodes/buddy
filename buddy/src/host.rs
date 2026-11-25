@@ -261,7 +261,7 @@ pub(crate) fn initialize(dir: &Path, addr: SocketAddr) -> Result<Pairing> {
 }
 enum HostEvent {
     Ready(Pairing),
-    Finished(Result<(), String>),
+    Finished(Result<()>),
 }
 struct Host {
     dir: PathBuf,
@@ -272,7 +272,7 @@ struct Host {
     handle: Option<axum_server::Handle<SocketAddr>>,
     pair: Option<Pairing>,
     invite: String,
-    notice: String,
+    notice: Result<String>,
 }
 impl Host {
     fn new(local: Local) -> Result<Self> {
@@ -303,7 +303,7 @@ impl Host {
             handle: None,
             pair: None,
             invite: String::new(),
-            notice: String::new(),
+            notice: Ok(String::new()),
         })
     }
     fn start(&mut self) -> Result<()> {
@@ -319,21 +319,29 @@ impl Host {
             .context("enter a port from 1 to 65535")?;
         let addr = SocketAddr::new(ip, port);
         // Reject an unusable address before persisting its server identity.
-        drop(
-            std::net::TcpListener::bind(addr)
-                .context("could not listen on that address and port")?,
-        );
+        if let Err(error) = std::net::TcpListener::bind(addr) {
+            let message = match error.kind() {
+                std::io::ErrorKind::AddrInUse => {
+                    format!("{addr} is already in use. Stop the other listener and try again.")
+                }
+                std::io::ErrorKind::AddrNotAvailable => format!(
+                    "This device can’t listen on {ip}. Check its network address and try again."
+                ),
+                _ => format!("Couldn’t listen on {addr}. Check the address and port."),
+            };
+            return Err(anyhow::Error::from(error).context(message));
+        }
         let pair = initialize(&self.dir, addr)?;
         let handle = axum_server::Handle::new();
         self.handle = Some(handle.clone());
-        self.notice.clear();
+        self.notice = Ok(String::new());
         let config = self.dir.join(CONFIG);
         let events = self.tx.clone();
         thread::spawn(move || {
             let result = server::serve_controlled(&config, handle, |_| {
                 let _ = events.send(HostEvent::Ready(pair));
             });
-            let _ = events.send(HostEvent::Finished(result.map_err(|e| format!("{e:#}"))));
+            let _ = events.send(HostEvent::Finished(result));
         });
         Ok(())
     }
@@ -345,7 +353,7 @@ impl Host {
                     self.pair = None;
                     self.handle = None;
                     self.invite.clear();
-                    self.notice = result.err().unwrap_or_else(|| "Server stopped.".into());
+                    self.notice = result.map(|()| "Server stopped.".into());
                 }
             }
         }
@@ -386,10 +394,8 @@ impl Host {
                 if ui.add(phase::primary("Export pairing file…")).clicked()
                     && let Some(path) = rfd::FileDialog::new().set_file_name(PAIR_FILE).save_file()
                 {
-                    self.notice = match Self::export(&self.dir, p, &path) {
-                        Ok(()) => "Pairing file exported.".into(),
-                        Err(e) => format!("{e:#}"),
-                    };
+                    self.notice =
+                        Self::export(&self.dir, p, &path).map(|()| "Pairing file exported.".into());
                 }
                 ui.add_space(5.);
                 ui.separator();
@@ -398,9 +404,9 @@ impl Host {
                     match server::invite(&self.dir.join(CONFIG)) {
                         Ok(code) => {
                             self.invite = code;
-                            self.notice.clear();
+                            self.notice = Ok(String::new());
                         }
-                        Err(e) => self.notice = format!("{e:#}"),
+                        Err(e) => self.notice = Err(e),
                     }
                 }
                 if !self.invite.is_empty() {
@@ -432,7 +438,7 @@ impl Host {
                     .clicked()
                     && let Err(e) = self.start()
                 {
-                    self.notice = format!("{e:#}");
+                    self.notice = Err(e);
                 }
                 if self.handle.is_some() {
                     ui.spinner();
@@ -442,8 +448,12 @@ impl Host {
         ui.collapsing("Server data folder", |ui| {
             ui.monospace(self.dir.display().to_string());
         });
-        if !self.notice.is_empty() {
-            ui.label(&self.notice);
+        match &self.notice {
+            Err(error) => ui::show_problem(ui, error),
+            Ok(notice) if !notice.is_empty() => {
+                ui.label(notice);
+            }
+            Ok(_) => {}
         }
     }
 }

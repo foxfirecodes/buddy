@@ -680,6 +680,7 @@ dependencies = [
  "uuid",
  "winapi-util",
  "windows-sys 0.61.2",
+ "zbus 4.4.0",
 ]
 
 [[package]]

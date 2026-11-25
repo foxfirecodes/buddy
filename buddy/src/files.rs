@@ -576,6 +576,31 @@ fn same_file_state(a: &cap_std::fs::Metadata, b: &cap_std::fs::Metadata) -> Resu
 pub struct Files {
     roots: BTreeMap<String, Root>,
 }
+
+#[derive(Debug)]
+pub(crate) enum SaveLocation {
+    Unavailable(PathBuf),
+    Changed(PathBuf),
+}
+
+impl std::fmt::Display for SaveLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(path) => write!(
+                f,
+                "Buddy couldn’t open this save location. Reconnect its drive or check permissions.\n\n{}",
+                path.display()
+            ),
+            Self::Changed(path) => write!(
+                f,
+                "The drive or root changed. Reconnect the original save location at {} or review it in Edit files.",
+                path.display()
+            ),
+        }
+    }
+}
+impl std::error::Error for SaveLocation {}
+
 impl Files {
     pub fn open(
         recipe: &Recipe,
@@ -590,14 +615,6 @@ impl Files {
                 .get(name)
                 .with_context(|| format!("bind slot {name} on this device"))?;
             let parent = anchor(&b.path, &slot.kind)?;
-            let canonical = parent
-                .canonicalize()
-                .with_context(|| format!("root unavailable: {}", parent.display()))?;
-            ensure!(
-                parent == canonical,
-                "root changed; review binding {}",
-                parent.display()
-            );
             ensure!(
                 !home.starts_with(&b.path) && !b.path.starts_with(home),
                 "save selection overlaps Buddy's own data"
@@ -610,23 +627,17 @@ impl Files {
                 b.path.display()
             );
             paths.push(&b.path);
-            let dir = Dir::open_ambient_dir(&parent, ambient_authority())?;
-            #[cfg(windows)]
+            let unavailable = || SaveLocation::Unavailable(b.path.clone());
             ensure!(
-                Some(identity(&dir)?) == b.identity,
-                "drive or root changed; review {}",
-                parent.display()
+                parent == parent.canonicalize().with_context(unavailable)?,
+                SaveLocation::Changed(b.path.clone())
             );
-            #[cfg(unix)]
-            {
-                use cap_std::fs::MetadataExt;
-                let m = dir.dir_metadata()?;
-                ensure!(
-                    m.dev() == b.dev && m.ino() == b.ino,
-                    "drive or root changed; review {}",
-                    parent.display()
-                );
-            }
+            let dir =
+                Dir::open_ambient_dir(&parent, ambient_authority()).with_context(unavailable)?;
+            ensure!(
+                b.matches_dir(&dir).with_context(unavailable)?,
+                SaveLocation::Changed(b.path.clone())
+            );
             let base = if slot.kind == Kind::Folder {
                 PathBuf::from(".")
             } else {

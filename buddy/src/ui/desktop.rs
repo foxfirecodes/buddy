@@ -302,6 +302,7 @@ impl App {
                         if ui.add(phase::primary("Copy command")).clicked() {
                             ctx.copy_text(command.clone());
                             self.note = "Install command copied".into();
+                            self.error = None;
                             true
                         } else {
                             close

@@ -363,7 +363,15 @@ pub fn validate_root_name(name: &str) -> Result<()> {
     Ok(())
 }
 pub fn canonical_url(url: &str) -> Result<String> {
-    let u = reqwest::Url::parse(url.trim())?;
+    let url = url.trim();
+    let (scheme, _) = url
+        .split_once("://")
+        .context("Include http:// or https:// in the server address.")?;
+    ensure!(
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"),
+        "Use http:// or https:// for the server address."
+    );
+    let u = reqwest::Url::parse(url).context("Enter a valid server address and port.")?;
     ensure!(
         u.username().is_empty()
             && u.password().is_none()
@@ -371,13 +379,10 @@ pub fn canonical_url(url: &str) -> Result<String> {
             && u.fragment().is_none(),
         "enter a server URL without credentials, query or fragment"
     );
-    ensure!(
-        matches!(u.scheme(), "http" | "https"),
-        "use an HTTP or HTTPS server URL"
-    );
     ensure!(u.has_host(), "missing host");
     Ok(u.as_str().trim_end_matches('/').to_owned())
 }
+
 #[derive(Clone)]
 pub struct Api {
     pub c: Credentials,
@@ -751,5 +756,25 @@ impl Local {
             locks.push(f);
         }
         Ok(locks)
+    }
+}
+
+#[cfg(test)]
+mod server_address_tests {
+    use super::canonical_url;
+
+    #[test]
+    fn bare_addresses_explain_how_to_choose_the_transport() {
+        for address in ["buddy.local", "buddy.local:7341", "[::1]:7341"] {
+            assert_eq!(
+                canonical_url(address).unwrap_err().to_string(),
+                "Include http:// or https:// in the server address."
+            );
+        }
+        assert_eq!(
+            canonical_url(" HTTP://[::1]:7341/ ").unwrap(),
+            "http://[::1]:7341"
+        );
+        assert!(canonical_url("https://name:password@buddy.local").is_err());
     }
 }

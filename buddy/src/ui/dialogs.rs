@@ -30,12 +30,26 @@ enum Decision {
         title: String,
         message: String,
         choices: Vec<String>,
+        #[serde(default)]
+        details: String,
     },
     Conflict {
         game: String,
         copies: [SaveCopy; 2],
     },
 }
+
+const DISMISSED: usize = 9;
+
+#[derive(Debug)]
+pub(crate) struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Cancelled")
+    }
+}
+impl std::error::Error for Cancelled {}
 
 impl Decision {
     fn ask(self, count: usize) -> Result<usize> {
@@ -44,17 +58,34 @@ impl Decision {
             .stdin(Stdio::piped())
             .spawn()?;
         serde_json::to_writer(child.stdin.take().context("open decision window")?, &self)?;
-        let code = child.wait()?.code().unwrap_or(1);
-        ensure!((10..10 + count as i32).contains(&code), "cancelled");
+        let status = child.wait()?;
+        if status.code() == Some(DISMISSED as i32) {
+            return Err(Cancelled.into());
+        }
+        let code = status.code().unwrap_or(-1);
+        ensure!(
+            (10..10 + count as i32).contains(&code),
+            "Buddy’s dialog closed unexpectedly ({status})"
+        );
         Ok((code - 10) as usize)
     }
 }
 
 pub fn choose(title: &str, message: &str, options: &[&str]) -> Result<usize> {
+    choose_with_details(title, message, options, "")
+}
+
+pub(crate) fn choose_with_details(
+    title: &str,
+    message: &str,
+    options: &[&str],
+    details: &str,
+) -> Result<usize> {
     Decision::Prompt {
         title: title.into(),
         message: message.into(),
         choices: options.iter().map(|s| s.to_string()).collect(),
+        details: details.to_owned(),
     }
     .ask(options.len())
 }
@@ -109,6 +140,7 @@ fn prompt(
     title: &str,
     message: &str,
     choices: &[String],
+    details: &str,
     focus: &mut usize,
     initial: bool,
 ) -> Option<usize> {
@@ -125,6 +157,9 @@ fn prompt(
         .max_height(remaining)
         .show(ui, |ui| {
             ui.label(message);
+            if !details.is_empty() && details != message {
+                ui.collapsing("Details", |ui| ui.monospace(details));
+            }
         });
     ui.add_space(15.);
     let mut picked = None;
@@ -265,7 +300,12 @@ pub fn decision_window() -> Result<i32> {
             );
             let safe = choices
                 .iter()
-                .position(|s| matches!(s.as_str(), "Cancel" | "Decide later" | "Leave pending"))
+                .position(|s| {
+                    matches!(
+                        s.as_str(),
+                        "Cancel" | "Decide later" | "Leave pending" | "Later"
+                    )
+                })
                 .unwrap_or(0);
             (title.clone(), [690., 330.], safe)
         }
@@ -275,7 +315,7 @@ pub fn decision_window() -> Result<i32> {
             2,
         ),
     };
-    let result = Arc::new(AtomicUsize::new(1));
+    let result = Arc::new(AtomicUsize::new(DISMISSED));
     let choice = result.clone();
     let mut initial = true;
     eframe::run_simple_native(&title, super::native(size), move |ctx, _| {
@@ -294,17 +334,19 @@ pub fn decision_window() -> Result<i32> {
                         title,
                         message,
                         choices,
+                        details,
                     } if choices.len() <= 3 => {
-                        prompt(ui, title, message, choices, &mut focus, initial)
+                        prompt(ui, title, message, choices, details, &mut focus, initial)
                     }
                     Decision::Prompt {
                         title,
                         message,
                         choices,
+                        details,
                     } => {
                         egui::ScrollArea::vertical()
                             .show(ui, |ui| {
-                                prompt(ui, title, message, choices, &mut focus, initial)
+                                prompt(ui, title, message, choices, details, &mut focus, initial)
                             })
                             .inner
                     }

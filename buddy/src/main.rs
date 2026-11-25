@@ -256,8 +256,13 @@ fn main() {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Buddy: {e:#}");
-            if window {
-                let _ = ui::choose("Buddy needs attention", &format!("{e:#}"), &["Close"]);
+            if window && !e.is::<ui::Cancelled>() {
+                let _ = ui::choose_with_details(
+                    "Buddy needs attention",
+                    &ui::error_summary(&e),
+                    &["Close"],
+                    &format!("{e:#}"),
+                );
             }
             e.downcast_ref::<session::PostGame>().map_or(1, |v| v.0)
         }

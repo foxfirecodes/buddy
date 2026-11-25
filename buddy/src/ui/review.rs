@@ -16,10 +16,10 @@ use std::{
 enum Inventory {
     Waiting,
     Scanning {
-        result: mpsc::Receiver<(Result<Preview, String>, bool)>,
+        result: mpsc::Receiver<(anyhow::Result<Preview>, bool)>,
         _alive: mpsc::Sender<()>,
     },
-    Ready(Result<Preview, String>, bool),
+    Ready(anyhow::Result<Preview>, bool),
 }
 struct Location {
     name: String,
@@ -280,7 +280,8 @@ impl Review {
                     Ok((value, missing)) => row.inventory = Inventory::Ready(value, missing),
                     Err(mpsc::TryRecvError::Empty) => return,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        row.inventory = Inventory::Ready(Err("File preview stopped".into()), false)
+                        row.inventory =
+                            Inventory::Ready(Err(anyhow::anyhow!("File preview stopped")), false)
                     }
                 }
             }
@@ -337,7 +338,7 @@ impl Review {
                 } else {
                     (v, missing.is_some())
                 };
-                let _ = tx.send((v.map_err(|e| format!("{e:#}")), missing));
+                let _ = tx.send((v, missing));
                 ctx.request_repaint();
             });
             row.inventory = Inventory::Scanning {
@@ -521,7 +522,10 @@ impl Review {
                 ui.weak("Destination does not exist yet");
             }
             Inventory::Ready(Err(e), _) => {
-                ui.colored_label(ui.visuals().error_fg_color, e);
+                super::show_problem(ui, e);
+                if ui.button("Retry preview").clicked() {
+                    row.inventory = Inventory::Waiting;
+                }
             }
             _ if row.path.is_some() => {
                 ui.weak("Counting files…");

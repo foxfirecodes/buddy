@@ -335,6 +335,11 @@ pub struct RunOptions {
     pub expected_scope: Option<String>,
 }
 pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -> Result<i32> {
+    let _executable_guard = if options.command.is_empty() {
+        None
+    } else {
+        crate::update::game_guard()?
+    };
     let c = local.credentials()?;
     let account = local.scope(&c);
     ensure!(

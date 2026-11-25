@@ -127,7 +127,7 @@ impl Local {
         c.pragma_update(None, "synchronous", "FULL")?;
         Ok(c)
     }
-    fn read<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+    pub(crate) fn read<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         self.db()?
             .query_row("SELECT v FROM state WHERE k=?", [key], |r| {
                 r.get::<_, String>(0)
@@ -136,7 +136,7 @@ impl Local {
             .map(|s| serde_json::from_str(&s).map_err(Into::into))
             .transpose()
     }
-    fn write(&self, key: &str, v: &impl Serialize) -> Result<()> {
+    pub(crate) fn write(&self, key: &str, v: &impl Serialize) -> Result<()> {
         self.db()?.execute(
             "INSERT INTO state VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
             params![key, serde_json::to_string(v)?],
@@ -149,9 +149,12 @@ impl Local {
         Ok(keyring::Entry::new("org.buddy.sync", &label)?)
     }
     pub fn credentials(&self) -> Result<Credentials> {
-        let mut c: Credentials = self
+        let c: Credentials = self
             .read("login")?
             .context("sign in to a Buddy server first")?;
+        self.unlock_credential(c)
+    }
+    pub(crate) fn unlock_credential(&self, mut c: Credentials) -> Result<Credentials> {
         if c.token.is_empty() {
             c.token = self
                 .credential_entry(&c)?
@@ -161,13 +164,34 @@ impl Local {
         Ok(c)
     }
     pub fn set_login(&self, c: &Credentials, private_file: bool) -> Result<()> {
+        self.write("login", &self.stored_credential(c, private_file)?)
+    }
+    pub(crate) fn stored_credential(
+        &self,
+        c: &Credentials,
+        private_file: bool,
+    ) -> Result<Credentials> {
         let mut record = c.clone();
         if !private_file {
             self.credential_entry(c)?.set_password(&c.token)
             .context("credential store unavailable; unlock it or explicitly choose private-file credential storage")?;
             record.token.clear();
         }
-        self.write("login", &record)
+        Ok(record)
+    }
+    pub(crate) fn finish_enrollment(&self, record: &Credentials) -> Result<()> {
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        ensure!(
+            tx.execute(
+                "INSERT OR IGNORE INTO state VALUES('login',?)",
+                [serde_json::to_string(record)?]
+            )? == 1,
+            "this profile already has a sign-in"
+        );
+        tx.execute("DELETE FROM state WHERE k='pending-enrollment'", [])?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn scope(&self, c: &Credentials) -> String {
         // Replacing a hosted server's identity starts a different local history even if its URL is reused.
@@ -359,7 +383,7 @@ pub struct Api {
     pub c: Credentials,
     client: Client,
 }
-fn http(paired_ca: Option<&str>) -> Result<Client> {
+pub(crate) fn http(paired_ca: Option<&str>) -> Result<Client> {
     let mut builder = Client::builder();
     if let Some(ca) = paired_ca {
         builder = builder
@@ -380,7 +404,7 @@ impl std::fmt::Display for ApiError {
     }
 }
 impl std::error::Error for ApiError {}
-fn checked(r: Response) -> Result<Response> {
+pub(crate) fn checked(r: Response) -> Result<Response> {
     let code = r.status();
     if code.is_success() {
         Ok(r)
@@ -612,12 +636,28 @@ pub fn discover() -> Vec<(String, String, PathBuf)> {
             }
         }
         if let Ok(shortcuts) = install.shortcuts() {
+            let mut links = None;
+            let buddy = std::env::current_exe().ok();
             for shortcut in shortcuts.flatten() {
                 let exe = PathBuf::from(shortcut.executable.trim_matches('"'));
-                let folder = exe
-                    .parent()
-                    .filter(|p| p.is_dir())
-                    .unwrap_or(Path::new(&shortcut.start_dir))
+                let original = if buddy.as_deref() == Some(exe.as_path()) {
+                    let links = links.get_or_insert_with(|| {
+                        crate::steam_launch::manage::shortcut_links(install.path(), &exe)
+                    });
+                    if links.buddy_entries.contains(&shortcut.app_id) {
+                        continue;
+                    }
+                    links.original.get(&shortcut.app_id)
+                } else {
+                    None
+                };
+                let folder = original
+                    .map(PathBuf::as_path)
+                    .or_else(|| {
+                        exe.parent()
+                            .filter(|p| buddy.as_deref() != Some(exe.as_path()) && p.is_dir())
+                    })
+                    .unwrap_or(Path::new(shortcut.start_dir.trim_matches('"')))
                     .to_owned();
                 games.insert(
                     format!("shortcut-{}", shortcut.app_id),

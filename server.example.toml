@@ -3,6 +3,11 @@
 listen = "127.0.0.1:7341"
 database = "buddy-data/server.sqlite3"
 
+# Publish a client build from this host with:
+# buddy publish-release --config server.toml linux-x86_64 /path/to/portable/buddy
+# buddy publish-release --config server.toml windows-x86_64 /path/to/buddy.exe
+# Keep the .releases directory beside the database when moving or backing up the host.
+
 # Optional physical chunk allowance per account, in bytes.
 # account_quota_bytes = 107374182400
 

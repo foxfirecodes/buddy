@@ -119,7 +119,13 @@ fn prompt(
     masthead(ui, None);
     heading(ui, title);
     ui.add_space(6.);
-    ui.label(message);
+    let remaining = (ui.available_height() - 56.).max(28.);
+    egui::ScrollArea::vertical()
+        .id_salt("prompt-body")
+        .max_height(remaining)
+        .show(ui, |ui| {
+            ui.label(message);
+        });
     ui.add_space(15.);
     let mut picked = None;
     ui.horizontal_wrapped(|ui| {
@@ -253,7 +259,10 @@ pub fn decision_window() -> Result<i32> {
     let question: Decision = serde_json::from_reader(io::stdin().lock())?;
     let (title, size, mut focus) = match &question {
         Decision::Prompt { title, choices, .. } => {
-            ensure!((1..=3).contains(&choices.len()), "invalid choices");
+            ensure!(
+                (1..=245).contains(&choices.len()),
+                "too many choices for one dialog"
+            );
             let safe = choices
                 .iter()
                 .position(|s| matches!(s.as_str(), "Cancel" | "Decide later" | "Leave pending"))
@@ -280,18 +289,31 @@ pub fn decision_window() -> Result<i32> {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     return;
                 }
-                let picked = egui::ScrollArea::vertical()
-                    .show(ui, |ui| match &question {
-                        Decision::Prompt {
-                            title,
-                            message,
-                            choices,
-                        } => prompt(ui, title, message, choices, &mut focus, initial),
-                        Decision::Conflict { game, copies } => {
-                            conflict(ui, game, copies, &mut focus, initial)
-                        }
-                    })
-                    .inner;
+                let picked = match &question {
+                    Decision::Prompt {
+                        title,
+                        message,
+                        choices,
+                    } if choices.len() <= 3 => {
+                        prompt(ui, title, message, choices, &mut focus, initial)
+                    }
+                    Decision::Prompt {
+                        title,
+                        message,
+                        choices,
+                    } => {
+                        egui::ScrollArea::vertical()
+                            .show(ui, |ui| {
+                                prompt(ui, title, message, choices, &mut focus, initial)
+                            })
+                            .inner
+                    }
+                    Decision::Conflict { game, copies } => {
+                        egui::ScrollArea::vertical()
+                            .show(ui, |ui| conflict(ui, game, copies, &mut focus, initial))
+                            .inner
+                    }
+                };
                 if let Some(i) = picked {
                     choice.store(i + 10, Ordering::Relaxed);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);

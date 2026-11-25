@@ -642,6 +642,7 @@ dependencies = [
  "argon2",
  "axum",
  "axum-server",
+ "base64 0.22.1",
  "blake3",
  "buddy-process",
  "cap-primitives",
@@ -652,22 +653,28 @@ dependencies = [
  "eframe",
  "fastcdc",
  "glob",
+ "hex",
  "hostname",
  "image",
  "inquire",
  "keyring",
+ "keyvalues-parser",
+ "object",
  "rcgen",
  "reqwest",
  "rfd",
+ "ring",
  "rusqlite",
  "rustix 1.1.6",
  "rustls",
+ "self-replace",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "steamlocate",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml",
  "unicode-normalization",
  "uuid",
@@ -3965,6 +3972,17 @@ checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "self-replace"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "609c5606d9d357b26e4ee1a7a01beac396628d0fa01ebbade2a09cefb88e65af"
+dependencies = [
+ "fastrand",
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

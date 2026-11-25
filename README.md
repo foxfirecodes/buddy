@@ -14,6 +14,23 @@ For headless hosting, run `buddy init-server` in the directory where you want to
 - [Phase design language](docs/design-language.md) describes Buddy’s visual style and links to the interactive reference.
 - [Run the Steam Deck launch probe](#buddy-launch-probe) to measure when Game Mode lets post-game work finish. This is a separate executable and experiment.
 
+## Install Buddy on another device
+
+On the server, publish the executable for each kind of client you use. For Steam Deck and Linux desktops, use the [portable Linux build](docs/sync.md#rebuild-for-another-platform).
+
+```sh
+buddy publish-release --config server.toml linux-x86_64 /path/to/portable/buddy
+buddy publish-release --config server.toml windows-x86_64 /path/to/buddy.exe
+```
+
+On a signed-in client, open **Settings → Pair a device**, choose the destination platform, and copy the command. Paste it into a shell on Linux or PowerShell on Windows. The command verifies and installs the build, links the device to your account, then offers **Add Buddy to Steam**. Anyone with the command can join your account once within ten minutes. With plain HTTP, use a trusted network, since the connection carries credentials.
+
+The terminal equivalent is `buddy install-command linux-x86_64` or `buddy install-command windows-x86_64`. The first time an existing HTTP client pairs or updates, enter the release signing key printed on the server by `publish-release`. In the CLI, add `--trust-key KEY`. Paired HTTPS clients use their existing server certificate. The new device receives the trusted signing key in the copied command.
+
+Linux installs to `~/.local/bin/buddy` by default. If that directory is outside your PATH and `~/bin` is already on it, the installer uses `~/bin`. You can set `XDG_BIN_HOME` to choose another location. If the chosen directory is outside your PATH, the installer prints a command to add it. Windows installs to `%LOCALAPPDATA%\Programs\Buddy\buddy.exe` and adds that directory to the user PATH for new terminals. The installer uses the OS credential store. A headless Linux device can explicitly opt into private-file credentials with `export BUDDY_ALLOW_FILE_CREDENTIAL=true` before running the command.
+
+To roll out a new build, repeat `publish-release` on the host. On each client choose **Settings → Update from server…** or run `buddy update`. Buddy verifies the release and updates the installed executable in place. Back up the host database and its adjacent `<database filename>.releases` directory together. That directory contains the published binaries and the private signing key clients trust.
+
 ## Buddy launch probe
 
 This prototype measures when Steam's launch command returns, whether the game outlives it, and whether an independent worker can still finish work after Steam stops the game. The worker captures a tiny test marker and writes a receipt three seconds later. Real games run with their original arguments and working directory. All probe writes go to the probe's own session directory. You can test with Steam Cloud left as it is.

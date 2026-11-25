@@ -1,3 +1,4 @@
+mod distribution;
 mod files;
 mod host;
 mod index;
@@ -13,7 +14,8 @@ mod session;
 mod setup;
 mod steam_launch;
 mod ui;
-use anyhow::Result;
+mod update;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use local::{Api, Local};
 use model::*;
@@ -56,6 +58,40 @@ enum Cmd {
     Invite {
         #[arg(long, default_value = "server.toml")]
         config: PathBuf,
+    },
+    /// Publish a native Buddy binary for devices installing or updating from this server.
+    PublishRelease {
+        #[arg(long, default_value = "server.toml")]
+        config: PathBuf,
+        #[arg(value_parser = ["linux-x86_64", "windows-x86_64"])]
+        platform: String,
+        binary: PathBuf,
+    },
+    /// Generate a one-time command to install Buddy and pair another device to your account.
+    InstallCommand {
+        #[arg(value_parser = ["linux-x86_64", "windows-x86_64"])]
+        platform: String,
+        /// First-time release key from the server operator.
+        #[arg(long)]
+        trust_key: Option<String>,
+    },
+    /// Update this executable to the build published by your server.
+    Update {
+        /// First-time release key from the server operator.
+        #[arg(long)]
+        trust_key: Option<String>,
+    },
+    #[command(hide = true)]
+    RedeemDevice {
+        #[arg(long, env = "BUDDY_ALLOW_FILE_CREDENTIAL", action = clap::ArgAction::SetTrue)]
+        private_file_credential: bool,
+    },
+    /// Offer to add the installed Buddy executable to Steam.
+    FinishInstall,
+    /// Install or remove Buddy integration on this Steam account.
+    Steam {
+        #[command(subcommand)]
+        action: SteamAction,
     },
     /// Reclaim unreferenced server chunks after the grace period.
     Gc {
@@ -141,6 +177,8 @@ enum Cmd {
         #[arg(long)]
         interactive: bool,
     },
+    /// Launch the saved command for a manually configured game through Buddy.
+    Play { game: String },
     /// Sync, launch the supplied game command, and capture its session.
     Run {
         #[arg(long)]
@@ -172,6 +210,26 @@ enum Cmd {
     /// Revoke a device token.
     Revoke { device: String },
 }
+#[derive(clap::Args)]
+struct SteamEdit {
+    /// Steam app, shortcut, or custom game ID. Omit to manage Buddy's own shortcut.
+    game: Option<String>,
+    /// Profile ID as shown by buddy steam profiles.
+    #[arg(long)]
+    steam_profile: Option<String>,
+    /// Apply without interactive confirmation, after Steam exits.
+    #[arg(long)]
+    yes: bool,
+}
+#[derive(Subcommand)]
+enum SteamAction {
+    /// List Steam accounts on this device.
+    Profiles,
+    /// Add the integration and remember the previous launch fields.
+    Install(SteamEdit),
+    /// Restore the original launch fields or remove the Buddy-created shortcut.
+    Uninstall(SteamEdit),
+}
 fn options() -> RunOptions {
     RunOptions {
         command: vec![],
@@ -192,7 +250,7 @@ fn main() {
     let args = Args::parse();
     let window = matches!(
         &args.command,
-        None | Some(Cmd::Gui | Cmd::Host | Cmd::Run { .. })
+        None | Some(Cmd::Gui | Cmd::Host | Cmd::Play { .. } | Cmd::Run { .. })
     );
     let code = match dispatch(args) {
         Ok(code) => code,
@@ -222,6 +280,14 @@ fn dispatch(args: Args) -> Result<i32> {
             server::serve(&config)?;
             return Ok(0);
         }
+        Cmd::PublishRelease {
+            config,
+            platform,
+            binary,
+        } => {
+            println!("{}", server::publish_release(&config, &platform, &binary)?);
+            return Ok(0);
+        }
         Cmd::Invite { config } => {
             println!("{}", server::invite(&config)?);
             return Ok(0);
@@ -236,6 +302,77 @@ fn dispatch(args: Args) -> Result<i32> {
                 Cmd::Gui => ui::gui(l)?,
                 Cmd::Host => host::gui(l)?,
                 Cmd::Tui => ui::tui(&l)?,
+                Cmd::FinishInstall => ui::finish_install(l)?,
+                Cmd::InstallCommand {
+                    platform,
+                    trust_key,
+                } => {
+                    println!(
+                        "{}",
+                        distribution::install_command(
+                            &l,
+                            &l.credentials()?,
+                            &platform,
+                            trust_key.as_deref()
+                        )?
+                    );
+                }
+                Cmd::RedeemDevice {
+                    private_file_credential,
+                } => {
+                    distribution::redeem_stdin(&l, private_file_credential)?;
+                }
+                Cmd::Update { trust_key } => {
+                    match update::run(&l, &l.credentials()?, trust_key.as_deref(), || Ok(true))? {
+                        update::Outcome::Current => println!("Buddy is up to date"),
+                        update::Outcome::Updated(path) => println!("Updated {}", path.display()),
+                        update::Outcome::Cancelled => {}
+                    }
+                }
+                Cmd::Steam { action } => {
+                    let (edit, install) = match action {
+                        SteamAction::Profiles => {
+                            ui::list_profiles()?;
+                            return Ok(0);
+                        }
+                        SteamAction::Install(edit) => (edit, true),
+                        SteamAction::Uninstall(edit) => (edit, false),
+                    };
+                    println!(
+                        "{}",
+                        ui::steam(
+                            &l,
+                            edit.game.as_deref(),
+                            Some(install),
+                            edit.steam_profile.as_deref(),
+                            Interface::Terminal,
+                            edit.yes
+                        )?
+                    );
+                }
+                Cmd::Play { game } => {
+                    let c = l.credentials()?;
+                    let launcher = l.launcher(&c, &game)?.context(
+                        "choose and save a local launcher in this game's Settings first",
+                    )?;
+                    // This process belongs to this launch; keep the GUI's working directory intact.
+                    std::env::set_current_dir(&launcher.directory)
+                        .context("open game working directory")?;
+                    let mut command = vec![launcher.executable.into_os_string()];
+                    command.extend(launcher.args.into_iter().map(OsString::from));
+                    return synchronize(
+                        &l,
+                        &game,
+                        RunOptions {
+                            command,
+                            manual: launcher.manual_exit,
+                            expected_scope: Some(l.scope(&c)),
+                            ..options()
+                        },
+                        Interface::Window,
+                    );
+                }
+
                 Cmd::Login {
                     url,
                     pairing,

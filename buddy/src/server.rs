@@ -20,6 +20,9 @@ use std::{
     time::Duration,
 };
 
+mod releases;
+pub use releases::publish_release;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -131,6 +134,9 @@ impl Store {
         c.execute_batch("PRAGMA journal_mode=WAL;
           CREATE TABLE IF NOT EXISTS accounts(name TEXT PRIMARY KEY,password TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS invites(hash TEXT PRIMARY KEY,expires INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS device_links(hash TEXT PRIMARY KEY,account TEXT NOT NULL,expires INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS releases(platform TEXT NOT NULL,generation INTEGER NOT NULL,sha256 TEXT NOT NULL,installer_hash TEXT NOT NULL,installer TEXT NOT NULL,manifest TEXT NOT NULL,PRIMARY KEY(platform,generation));
+          CREATE INDEX IF NOT EXISTS published_binary ON releases(sha256);
           CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY,account TEXT NOT NULL,name TEXT NOT NULL,token TEXT NOT NULL UNIQUE);
           CREATE TABLE IF NOT EXISTS attempts(peer TEXT PRIMARY KEY, starts INTEGER NOT NULL,n INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS games(account TEXT,game TEXT,recipe TEXT NOT NULL,revision INTEGER NOT NULL,shared INTEGER NOT NULL,head INTEGER,
@@ -215,7 +221,7 @@ pub fn serve_controlled(
                 tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
             }
         });
-        let app = Router::new()
+        let app = releases::routes().merge(Router::new()
             .route("/v1/login", post(login))
             .route("/v1/rpc", post(rpc))
             .route(
@@ -229,7 +235,7 @@ pub fn serve_controlled(
                     .put(upload)
                     .layer(DefaultBodyLimit::max(MAX_CHUNK)),
             )
-            .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+            .layer(DefaultBodyLimit::max(32 * 1024 * 1024)))
             .with_state(s);
         let listener = std::net::TcpListener::bind(cfg.listen)?;
         listener.set_nonblocking(true)?;

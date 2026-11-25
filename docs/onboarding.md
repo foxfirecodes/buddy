@@ -29,6 +29,16 @@ Review the total files and bytes, then choose **Save setup** to apply the checke
 
 For broader path suggestions, **Settings → Path suggestions → Download from Ludusavi** fetches the upstream catalog on that device. Refreshing checks its ETag. **Import local YAML…** works with a catalog you already have. [Upstream manifest](https://github.com/mtkennerly/ludusavi-manifest)
 
+## Connect a game to Steam
+
+Open the game in Buddy and choose **Manage in Steam…**. Pick the Steam account if more than one uses this device. When prompted, choose **Steam → Exit**, then continue in Buddy. Review the original and proposed launch fields and confirm the change. Reopen Steam and press **Play**. Run Buddy directly from Desktop Mode for this step on Deck so its window stays open when Steam exits.
+
+For a store game, Buddy adds its wrapper to Launch Options. Simple arguments and a wrapper such as `mangohud %command%` carry through. For an existing native non-Steam shortcut, Buddy updates Target and Launch Options while retaining Start In and the shortcut ID. On Linux, a Windows executable or a shortcut with a Steam compatibility tool keeps its target so Steam can start the selected runtime. For a manually configured game, save its launcher in Buddy first. The new Steam shortcut then uses that launcher's executable, working directory and arguments. For sandboxed Steam installations, Steam needs access to the installed Buddy binary and selected files.
+
+Choose **Manage in Steam…** again to uninstall. Buddy shows later changes to the managed fields before restoring the originals. Removing a shortcut that Buddy created removes its library entry. If you've customized that shortcut, Buddy leaves the entry for you to review in Steam. Removing the integration leaves your saves and recipe on disk.
+
+To add Buddy itself to the library, open the top-right **Settings → Add Buddy to Steam…**. An existing matching shortcut can stay in place. The same actions are available under `buddy steam --help`.
+
 ## Trial results
 
 On Linux, a fresh client started the HTTPS host through the graphical window, created an account with an invite and enrolled a disposable two-file selection after previewing both names and the 19-byte total. In the Windows 11 trial that preceded the Phase redesign, the host started from the client, exported the public pairing file through a native file picker, and displayed the matching fingerprint after import. A second Windows client profile signed in through HTTPS. The generated host directory had a protected NTFS access list, and only the current account and SYSTEM had access to the private key and database.

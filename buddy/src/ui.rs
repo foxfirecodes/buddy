@@ -17,6 +17,8 @@ use std::{
     time::Duration,
 };
 
+mod desktop;
+pub(crate) use desktop::{finish_install, list_profiles, steam};
 mod dialogs;
 pub(crate) use crate::phase::style;
 pub use dialogs::{Progress, choose, decision_window, progress_window};
@@ -75,6 +77,9 @@ enum Event {
     Games(Vec<Row>),
     Detail(Box<Detail>),
     Done(String),
+    Notice(String),
+    ReleaseDialog(desktop::ReleaseDialog),
+    Restarted,
 }
 type Reply = Result<Event, String>;
 struct App {
@@ -83,6 +88,8 @@ struct App {
     tx: mpsc::Sender<Reply>,
     busy: bool,
     signed: bool,
+    offer_steam: bool,
+    release_dialog: Option<desktop::ReleaseDialog>,
     join_step: JoinStep,
     url: String,
     account: String,
@@ -197,7 +204,7 @@ fn game_tile(
 }
 
 impl App {
-    fn new(local: Local) -> Self {
+    fn new(local: Local, offer_steam: bool) -> Self {
         let (tx, rx) = mpsc::channel();
         let c = local.credentials().ok();
         let signed = c.is_some();
@@ -208,6 +215,8 @@ impl App {
             rx,
             busy: false,
             signed,
+            offer_steam,
+            release_dialog: None,
             join_step: JoinStep::Welcome,
             url: c
                 .as_ref()
@@ -454,6 +463,9 @@ impl App {
                     game,
                 )
             });
+        if ui.button("Manage in Steam…").clicked() {
+            self.steam_action(Some(game.to_owned()), None);
+        }
         match fields {
             Ok(f) if f.store_title => {
                 if ui.button("Copy launch options").clicked() {
@@ -597,7 +609,7 @@ impl App {
             #[cfg(target_os = "linux")]
             if new_proton_game {
                 ui.collapsing("First Play with Proton", |ui| {
-                    ui.label("Copy the launch options and press Play in Steam to initialize a new prefix.");
+                    ui.label("Set up the Steam launch options, then press Play to initialize the prefix.");
                     self.launch_fields(ui, &game);
                 });
             }
@@ -685,22 +697,13 @@ impl App {
         {
             self.sync(None, false);
         }
-        if let Some(launch) = self.detail.as_ref().and_then(|d| d.launcher.clone())
-            && ui.button("Play").clicked()
+        if self.detail.as_ref().is_some_and(|d| d.launcher.is_some()) && ui.button("Play").clicked()
         {
             let selected = game.to_owned();
             self.job(move |local| {
-                let mut cmd = Command::new(std::env::current_exe()?);
-                cmd.env("BUDDY_HOME", &local.home);
-                cmd.args(["run", "--game", &selected]);
-                if launch.manual_exit {
-                    cmd.arg("--manual-exit");
-                }
-                let status = cmd
-                    .arg("--")
-                    .arg(launch.executable)
-                    .args(launch.args)
-                    .current_dir(launch.directory)
+                let status = Command::new(std::env::current_exe()?)
+                    .env("BUDDY_HOME", &local.home)
+                    .args(["play", &selected])
                     .status()?;
                 Ok(Event::Done(format!("Game closed ({status})")))
             });
@@ -942,6 +945,9 @@ impl eframe::App for App {
                         self.detail = Some(*d);
                     }
                 }
+                Ok(Event::Notice(s)) => self.note = s,
+                Ok(Event::ReleaseDialog(d)) => self.release_dialog = Some(d),
+                Ok(Event::Restarted) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 Ok(Event::Done(s)) => {
                     self.finished(s);
                 }
@@ -977,13 +983,20 @@ impl eframe::App for App {
                             ui.allocate_exact_size(egui::vec2(width, 24.), egui::Sense::hover());
                         phase::traces(ui.painter(), rect, Some(1.));
                     }
-                    if self.signed {
-                        let show_device = ui.available_width() > 250.;
+                    {
+                        let show_device = self.signed && ui.available_width() > 250.;
                         let layout = egui::Layout::right_to_left(egui::Align::Center);
                         ui.with_layout(layout, |ui| {
                             ui.menu_button("Settings", |ui| {
-                                ui.strong(&self.account);
-                                ui.weak(&self.device);
+                                if self.signed {
+                                    ui.strong(&self.account);
+                                    ui.weak(&self.device);
+                                    ui.separator();
+                                }
+                                self.device_menu(ui);
+                                if !self.signed {
+                                    return;
+                                }
                                 ui.separator();
                                 if ui.button("Host a server").clicked() {
                                     ui.close();
@@ -1119,18 +1132,22 @@ impl eframe::App for App {
                     }
                 });
             });
+        self.show_device_dialog(ctx);
         if self.busy {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 }
 pub fn gui(l: Local) -> Result<()> {
+    open_gui(l, false)
+}
+fn open_gui(l: Local, offer_steam: bool) -> Result<()> {
     eframe::run_native(
         "Buddy",
         native([970., 680.]),
         Box::new(move |cc| {
             style(&cc.egui_ctx);
-            Ok(Box::new(App::new(l)))
+            Ok(Box::new(App::new(l, offer_steam)))
         }),
     )
     .map_err(|e| anyhow!(e.to_string()))

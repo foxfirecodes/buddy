@@ -90,7 +90,7 @@ fn suggested_ip() -> IpAddr {
         .unwrap_or_else(|_| std::net::Ipv4Addr::LOCALHOST.into())
 }
 #[cfg(unix)]
-fn protect_dir(dir: &Path) -> Result<()> {
+pub(crate) fn protect_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     Ok(())
@@ -153,7 +153,7 @@ fn current_user_sid() -> Result<String> {
     }
 }
 #[cfg(windows)]
-fn protect_dir(dir: &Path) -> Result<()> {
+pub(crate) fn protect_dir(dir: &Path) -> Result<()> {
     use std::{io, os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::{
         Foundation::LocalFree,

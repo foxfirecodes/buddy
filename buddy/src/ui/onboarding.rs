@@ -142,7 +142,7 @@ impl App {
                 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
                 cmd.creation_flags(CREATE_NO_WINDOW);
             }
-            cmd.arg("host").spawn()?;
+            cmd.args(["server", "gui"]).spawn()?;
             Ok(())
         })();
         if let Err(error) = opened {

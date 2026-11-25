@@ -267,7 +267,9 @@ impl App {
             match dialog {
                 ReleaseDialog::Trust(action, key) => {
                     ui.heading("Trust this release key");
-                    ui.label("Paste the key printed by buddy publish-release on your server.");
+                    ui.label(
+                        "Run buddy server status on your server and paste the release signing key.",
+                    );
                     ui.add(
                         egui::TextEdit::singleline(key)
                             .hint_text("Release key")

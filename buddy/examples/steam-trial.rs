@@ -140,7 +140,7 @@ impl Trial {
         )?;
         let mut server = Server(
             Command::new(&self.buddy)
-                .arg("serve")
+                .args(["server", "serve"])
                 .arg("--config")
                 .arg(self.root.join("server.toml"))
                 .stderr(Stdio::piped())
@@ -166,7 +166,7 @@ impl Trial {
     fn prepare(&self, url: &str) -> Result<()> {
         let invite = check(
             Command::new(&self.buddy)
-                .arg("invite")
+                .args(["server", "invite"])
                 .arg("--config")
                 .arg(self.root.join("server.toml"))
                 .output()?,

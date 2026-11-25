@@ -31,14 +31,14 @@ def interrupted_restore(profile, world, old, new):
 def run(root):
     cfg = root / "server.toml"
     cfg.write_text('listen="127.0.0.1:0"\ndatabase="server.sqlite"\n')
-    server = subprocess.Popen([binary, "serve", "--config", cfg], stderr=subprocess.PIPE, text=True)
+    server = subprocess.Popen([binary, "server", "serve", "--config", cfg], stderr=subprocess.PIPE, text=True)
     try:
         url = "http://" + server.stderr.readline().split()[-1]
         pa, pb = root / "profile-a", root / "profile-b"
         a, b = root / "world-a", root / "world-b"
         for profile, world in [(pa, a), (pb, b)]:
             world.mkdir()
-            flags = ["--invite", cli(profile, "invite", "--config", cfg).strip()] if profile == pa else []
+            flags = ["--invite", cli(profile, "server", "invite", "--config", cfg).strip()] if profile == pa else []
             cli(profile, "login", url, "player", "--password-stdin", "--private-file-credential",
                 *flags, input="test-password\n")
             cli(profile, "setup", "world", world)

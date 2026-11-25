@@ -107,7 +107,7 @@ def handler(link):
 def service(root, rate):
     cfg = root/'server.toml'
     cfg.write_text('listen="127.0.0.1:0"\ndatabase="store.sqlite"\n')
-    srv = subprocess.Popen([binary, 'serve', '--config', cfg], stderr=subprocess.PIPE, text=True)
+    srv = subprocess.Popen([binary, 'server', 'serve', '--config', cfg], stderr=subprocess.PIPE, text=True)
     try:
         line = srv.stderr.readline()
         assert line.startswith('Buddy listening on '), line
@@ -126,7 +126,7 @@ def service(root, rate):
 
 
 def setup(profile, world, cfg, endpoint, new=False):
-    flags = ['--invite', cli(profile, 'invite', '--config', cfg).strip()] if new else []
+    flags = ['--invite', cli(profile, 'server', 'invite', '--config', cfg).strip()] if new else []
     cli(profile, 'login', endpoint, 'tester', '--device', profile.name, '--password-stdin',
         '--private-file-credential', *flags, input='private-benchmark\n')
     cli(profile, 'setup', 'world', world)

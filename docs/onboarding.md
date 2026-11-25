@@ -15,7 +15,7 @@ Choose **Use an invite** on the first device. Enter the invite, account name, pa
 
 On Linux, if the session has no Secret Service provider, Buddy shows where it will keep the device token. Choose **Sign in and save token** or **Create account and save token** to store it in Buddy’s private app data. If a credential store is available but a write fails, you can retry it or choose private app data using the same sign-in. For a previously saved account, unlock the store and choose **Retry after unlocking** when prompted. Buddy only uses your password to sign in.
 
-These clients must be able to reach the selected IP and TCP port. If your firewall prompts when the host starts, allow incoming access for the home network. The host window runs as your current user. For unattended hosting, run the same executable with `buddy serve --config PATH_TO_SERVER_TOML`; expand **Server data folder** in the host window to find that TOML. The graphical host and the headless process share the same settings and cannot both listen on the same port.
+These clients must be able to reach the selected IP and TCP port. If your firewall prompts when the host starts, allow incoming access for the home network. You can open the host window directly with `buddy server gui`. For unattended hosting, expand **Server data folder** in the window to find its settings, then run `buddy server serve --config PATH_TO_SERVER_TOML`. The graphical host and the headless process share the same settings and cannot both listen on the same port.
 
 The CLI supports `buddy login SERVER_URL ACCOUNT --pairing PATH_TO_PAIRING_FILE`. The TUI prompts for a pairing file at sign-in. Manually configured servers with a publicly or system-trusted HTTPS certificate can still use the normal server URL.
 

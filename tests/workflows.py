@@ -12,7 +12,7 @@ from sync import binary, cli, post
 def run(root):
     config = root / "server.toml"
     config.write_text('listen="127.0.0.1:0"\ndatabase="server.sqlite"\n')
-    server = subprocess.Popen([binary, "serve", "--config", config], stderr=subprocess.PIPE, text=True)
+    server = subprocess.Popen([binary, "server", "serve", "--config", config], stderr=subprocess.PIPE, text=True)
     try:
         line = server.stderr.readline().strip()
         assert line.startswith("Buddy listening on "), line
@@ -23,7 +23,7 @@ def run(root):
         env = {"BUDDY_ALLOW_FILE_CREDENTIAL": "true"}
         def call(profile, *args, **kwargs):
             return cli(profile, *args, extra=env, **kwargs)
-        invite = call(a, "invite", "--config", config).strip()
+        invite = call(a, "server", "invite", "--config", config).strip()
         for profile, world in ((a, world_a), (b, world_b)):
             call(profile, "login", url, "player", "--device", profile.name, "--password-stdin",
                  *(["--invite", invite] if profile == a else []), input="password123\n")

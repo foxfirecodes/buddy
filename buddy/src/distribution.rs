@@ -60,7 +60,7 @@ pub(crate) struct SignedRelease {
     pub signature: String,
 }
 impl SignedRelease {
-    fn verify(&self, platform: &str) -> Result<()> {
+    pub(crate) fn verify(&self, platform: &str) -> Result<()> {
         let r = &self.release;
         ensure!(
             platform_ok(platform)
@@ -155,7 +155,7 @@ impl std::fmt::Display for UntrustedReleaseKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "verify the release signing key printed by buddy publish-release on the host, then supply --trust-key KEY"
+            "run buddy server status on the host, then supply its release signing key with --trust-key KEY"
         )
     }
 }

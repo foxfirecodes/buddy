@@ -17,7 +17,7 @@ def run(root):
     cfg.write_text('listen="127.0.0.1:0"\ndatabase="server.sqlite"\n')
 
     def start():
-        process = subprocess.Popen([binary, "serve", "--config", cfg], stderr=subprocess.PIPE, text=True)
+        process = subprocess.Popen([binary, "server", "serve", "--config", cfg], stderr=subprocess.PIPE, text=True)
         line = process.stderr.readline()
         assert line.startswith("Buddy listening on "), line
         return process, line.split()[-1]
@@ -30,7 +30,7 @@ def run(root):
     game = "sample"
     waiting = None
     try:
-        invite = cli(a, "invite", "--config", cfg).strip()
+        invite = cli(a, "server", "invite", "--config", cfg).strip()
         for profile in [a, b, c]:
             args = ["--invite", invite] if profile == a else []
             cli(profile, "login", url, "player", "--password-stdin", "--private-file-credential",

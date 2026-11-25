@@ -11,13 +11,13 @@ For graphical hosting on your home network, choose **Host a server** when openin
 For headless hosting, run the installed binary in the directory where you want to keep the server settings and data.
 
 ```sh
-buddy init-server
+buddy server init
 # Edit listen in server.toml before starting the server.
-buddy invite
-buddy serve
+buddy server invite
+buddy server serve
 ```
 
-`init-server` copies the bundled example to `./server.toml` and preserves any existing file. The default listener is `127.0.0.1:7341`. To reach Buddy from another device, set `listen` to the server's address on the desired interface, for example `"192.168.1.20:7341"`, or use `"0.0.0.0:7341"` for all IPv4 interfaces. An IPv6 address takes brackets, as in `"[fd00::20]:7341"`. Plain HTTP on a non-loopback address starts with a warning because Buddy sends credentials and saves without TLS.
+`buddy server init` copies the bundled example to `./server.toml` and preserves any existing file. The default listener is `127.0.0.1:7341`. To reach Buddy from another device, set `listen` to the server's address on the desired interface, for example `"192.168.1.20:7341"`, or use `"0.0.0.0:7341"` for all IPv4 interfaces. An IPv6 address takes brackets, as in `"[fd00::20]:7341"`. Plain HTTP on a non-loopback address starts with a warning because Buddy sends credentials and saves without TLS.
 
 Keep the server terminal open. On each client choose **Join a server → Enter server address** and enter the reachable URL, for example `http://192.168.1.20:7341`. Choose **Use an invite**, then enter the invite, an account name, a password, and a device name such as **Desktop**. An invite is valid for one new account for 24 hours. Sign the second device into the same account with its own device name.
 
@@ -92,7 +92,7 @@ If sync fails after a game exits, Buddy tells you whether it has captured the ch
 
 Buddy records a restore plan before changing a live file and retains chunks for both versions locally. After an interruption, the next sync finishes the restore before launching. To put the pre-restore tree back, close the game and run `buddy rollback GAME`. If an unrelated process edits a file mid-restore, Buddy stops and identifies the affected path. For an interrupted game, the next wrapped launch asks you to confirm it has closed before capturing the surviving files. An expired lease still requires the second device's explicit takeover because the first device might be asleep with the game open.
 
-Run `buddy cache-gc` to reclaim locally unreferenced chunks. On the server, `buddy gc --config server.example.toml` reclaims unreferenced chunks after a 24-hour grace period. The same sweep runs every six hours. SQLite can reuse the freed space internally. Back up a live database using SQLite's online backup facility, or stop the server before taking a filesystem copy of its database directory.
+Run `buddy cache-gc` to reclaim locally unreferenced chunks. On the server, `buddy server gc --config server.example.toml` reclaims unreferenced chunks after a 24-hour grace period. The same sweep runs every six hours. SQLite can reuse the freed space internally. Back up a live database using SQLite's online backup facility, or stop the server before taking a filesystem copy of its database directory.
 
 The Linux integration suites use isolated profiles and temporary files. Run them against a release binary:
 

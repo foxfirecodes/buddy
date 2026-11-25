@@ -39,7 +39,11 @@ struct Args {
 enum Cmd {
     /// Open the graphical client.
     Gui,
-    /// Set up or run a private HTTPS Buddy server in a window.
+    /// Configure and operate a Buddy server.
+    #[command(subcommand)]
+    Server(ServerCommand),
+    // Keep existing launchers, services, and scripts working.
+    #[command(hide = true)]
     Host,
     /// Open the interactive terminal client.
     Tui,
@@ -47,26 +51,16 @@ enum Cmd {
     Decision,
     #[command(hide = true, name = "_progress")]
     Progress,
-    /// Copy the default server.toml to the current directory.
+    #[command(hide = true)]
     InitServer,
-    /// Start the control server.
-    Serve {
-        #[arg(long, default_value = "server.toml")]
-        config: PathBuf,
-    },
-    /// Create a single-use registration invite.
-    Invite {
-        #[arg(long, default_value = "server.toml")]
-        config: PathBuf,
-    },
-    /// Publish a native Buddy binary for devices installing or updating from this server.
-    PublishRelease {
-        #[arg(long, default_value = "server.toml")]
-        config: PathBuf,
-        #[arg(value_parser = ["linux-x86_64", "windows-x86_64"])]
-        platform: String,
-        binary: PathBuf,
-    },
+    #[command(hide = true)]
+    Serve(ServerConfig),
+    #[command(hide = true)]
+    Invite(ServerConfig),
+    #[command(hide = true)]
+    PublishRelease(PublishRelease),
+    #[command(hide = true)]
+    Gc(ServerConfig),
     /// Generate a one-time command to install Buddy and pair another device to your account.
     InstallCommand {
         #[arg(value_parser = ["linux-x86_64", "windows-x86_64"])]
@@ -92,11 +86,6 @@ enum Cmd {
     Steam {
         #[command(subcommand)]
         action: SteamAction,
-    },
-    /// Reclaim unreferenced server chunks after the grace period.
-    Gc {
-        #[arg(long, default_value = "server.toml")]
-        config: PathBuf,
     },
     /// Register or sign this device in.
     Login {
@@ -221,6 +210,40 @@ enum Cmd {
     /// Revoke a device token.
     Revoke { device: String },
 }
+
+#[derive(Subcommand)]
+enum ServerCommand {
+    /// Copy the default server.toml to the current directory.
+    Init,
+    /// Start the control server in the foreground.
+    Serve(ServerConfig),
+    /// Show the configured listener, database, public release key, and published builds.
+    Status(ServerConfig),
+    /// Create a single-use registration invite.
+    Invite(ServerConfig),
+    /// Publish a Buddy executable for client installs and updates.
+    PublishRelease(PublishRelease),
+    /// Reclaim unreferenced server chunks after the grace period.
+    Gc(ServerConfig),
+    /// Set up or run a private HTTPS Buddy server in a window.
+    Gui,
+}
+
+#[derive(clap::Args)]
+struct ServerConfig {
+    #[arg(long, default_value = "server.toml")]
+    config: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct PublishRelease {
+    #[command(flatten)]
+    server: ServerConfig,
+    #[arg(value_parser = ["linux-x86_64", "windows-x86_64"])]
+    platform: String,
+    binary: PathBuf,
+}
+
 #[derive(clap::Args)]
 struct SteamEdit {
     /// Steam app, shortcut, or custom game ID. Omit to manage Buddy's own shortcut.
@@ -262,7 +285,13 @@ fn main() {
     let args = Args::parse();
     let window = matches!(
         &args.command,
-        None | Some(Cmd::Gui | Cmd::Host | Cmd::Play { .. } | Cmd::Run { .. })
+        None | Some(
+            Cmd::Gui
+                | Cmd::Server(ServerCommand::Gui)
+                | Cmd::Host
+                | Cmd::Play { .. }
+                | Cmd::Run { .. }
+        )
     );
     let code = match dispatch(args) {
         Ok(code) => code,
@@ -288,36 +317,39 @@ fn dispatch(args: Args) -> Result<i32> {
             ui::progress_window()?;
             return Ok(0);
         }
-        Cmd::InitServer => {
+        Cmd::Server(ServerCommand::Init) | Cmd::InitServer => {
             server::init_config()?;
             println!("Created server.toml");
             return Ok(0);
         }
-        Cmd::Serve { config } => {
-            server::serve(&config)?;
+        Cmd::Server(ServerCommand::Serve(s)) | Cmd::Serve(s) => {
+            server::serve(&s.config)?;
             return Ok(0);
         }
-        Cmd::PublishRelease {
-            config,
-            platform,
-            binary,
-        } => {
-            println!("{}", server::publish_release(&config, &platform, &binary)?);
+        Cmd::Server(ServerCommand::Status(s)) => {
+            println!("{}", server::status(&s.config)?);
             return Ok(0);
         }
-        Cmd::Invite { config } => {
-            println!("{}", server::invite(&config)?);
+        Cmd::Server(ServerCommand::PublishRelease(p)) | Cmd::PublishRelease(p) => {
+            println!(
+                "{}",
+                server::publish_release(&p.server.config, &p.platform, &p.binary)?
+            );
             return Ok(0);
         }
-        Cmd::Gc { config } => {
-            println!("Removed {} unused chunks", server::gc(&config)?);
+        Cmd::Server(ServerCommand::Invite(s)) | Cmd::Invite(s) => {
+            println!("{}", server::invite(&s.config)?);
+            return Ok(0);
+        }
+        Cmd::Server(ServerCommand::Gc(s)) | Cmd::Gc(s) => {
+            println!("Removed {} unused chunks", server::gc(&s.config)?);
             return Ok(0);
         }
         cmd => {
             let l = Local::open(args.profile_dir)?;
             match cmd {
                 Cmd::Gui => ui::gui(l)?,
-                Cmd::Host => host::gui(l)?,
+                Cmd::Server(ServerCommand::Gui) | Cmd::Host => host::gui(l)?,
                 Cmd::Tui => ui::tui(&l)?,
                 Cmd::FinishInstall => ui::finish_install(l)?,
                 Cmd::InstallCommand {

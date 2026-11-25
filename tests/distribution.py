@@ -45,7 +45,13 @@ def run(root, tls):
                  str(root/"extensions"), "-out", str(root/"server.pem")])
         with cfg.open("a") as f:
             f.write('[tls]\ncertificate="server.pem"\nprivate_key="server.key"\n')
-    server = subprocess.Popen([BUDDY, "serve", "--config", cfg], stderr=subprocess.PIPE, text=True)
+    status = [BUDDY, "server", "status", "--config", cfg]
+    empty = execute(status)
+    scheme = "https" if tls else "http"
+    assert f"Configured listener: {scheme}://127.0.0.1:0" in empty
+    assert f"Database: {db}" in empty and "No published releases" in empty
+    assert not db.exists() and not Path(str(db) + ".releases").exists()
+    server = subprocess.Popen([BUDDY, "server", "serve", "--config", cfg], stderr=subprocess.PIPE, text=True)
     owner = root / "desktop"
     second = root / "receiver"
     bindir = root / "bin with space"
@@ -58,7 +64,7 @@ def run(root, tls):
         assert "Buddy listening" in line, line
         url = ("https://" if tls else "http://") + line.strip().split()[-1]
         owner_cli = [BUDDY, "--profile-dir", owner]
-        invite = execute([BUDDY, "invite", "--config", cfg]).strip()
+        invite = execute([BUDDY, "server", "invite", "--config", cfg]).strip()
         pairing = []
         if tls:
             pair = root/"pair.json"
@@ -66,14 +72,17 @@ def run(root, tls):
             pairing = ["--pairing", pair]
         execute(owner_cli + ["login", url, "player", "--device", "desktop", "--invite", invite,
                              "--password-stdin", "--private-file-credential"] + pairing, input="a-fixture-password\n")
-        publish = [BUDDY, "publish-release", "--config", cfg]
+        publish = [BUDDY, "server", "publish-release", "--config", cfg]
         link = owner_cli + ["install-command", PLATFORM]
         assert "publish-release" in execute(link, ok=False)
         assert "does not match" in execute(publish + ["windows-x86_64", BUDDY], ok=False)
         report = execute(publish + [PLATFORM, BUDDY])
         assert "release 1\n" in report
         pin = report.strip().split()[-1]
+        listing = execute(status)
+        assert f"Release signing key: {pin}" in listing and f"{PLATFORM}: release 1" in listing
         assert report == execute(publish + [PLATFORM, BUDDY])
+        assert report == execute([BUDDY, "publish-release", "--config", cfg, PLATFORM, BUDDY])
         if not tls:
             assert "--trust-key" in execute(link, ok=False)
             assert "differs" in execute(link + ["--trust-key", "0" * 64], ok=False)
@@ -87,6 +96,7 @@ def run(root, tls):
             altered["release"]["generation"] += 1
             dbcon.execute("UPDATE releases SET manifest=?", [json.dumps(altered)])
         assert "signature verification failed" in execute(link, ok=False)
+        assert "signature verification failed" in execute(status, ok=False)
         with dbcon:
             dbcon.execute("UPDATE releases SET manifest=?", [manifest])
             dbcon.execute("UPDATE releases SET installer='exit 0'")
@@ -137,9 +147,11 @@ def run(root, tls):
         with generation_two.open("ab") as f:
             f.write(b"fixture build 2")
         assert "release 2" in execute(publish + [PLATFORM, generation_two])
+        listing = execute(status)
+        assert f"{PLATFORM}: release 2" in listing and f"{PLATFORM}: release 1" not in listing
         retry_command = execute(link).strip()
         other = root / "other-account"
-        invite = execute([BUDDY, "invite", "--config", cfg]).strip()
+        invite = execute([BUDDY, "server", "invite", "--config", cfg]).strip()
         execute([BUDDY, "--profile-dir", other, "login", url, "other", "--device", "desktop",
                  "--invite", invite, "--password-stdin", "--private-file-credential"] + pairing,
                 input="another-fixture-password\n")

@@ -48,7 +48,7 @@ def rpc(url, token, action, **fields):
 
 
 def start(config):
-    server=subprocess.Popen([binary,"serve","--config",str(config)], stderr=subprocess.PIPE,text=True)
+    server=subprocess.Popen([binary,"server","serve","--config",str(config)], stderr=subprocess.PIPE,text=True)
     line=server.stderr.readline().strip()
     assert line.startswith("Buddy listening on "),line
     return server,line.split()[-1]
@@ -262,7 +262,7 @@ def run():
             window("Buddy",None)
         finally:
             gui.terminate();gui.wait(timeout=4)
-        invite=call("A","invite","--config",config).strip()
+        invite=call("A","server","invite","--config",config).strip()
         for profile,folder in [("A",a),("B",b)]:
             flags=["--invite",invite] if profile=="A" else []
             call(profile,"login",url,"player","--device",profile,"--password-stdin",*flags,data="password123\n")

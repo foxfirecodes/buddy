@@ -34,7 +34,7 @@ def post(url, route, value, token=""):
 
 def main(root, address):
     config = root / "server.toml"
-    init = [binary, "init-server"]
+    init = [binary, "server", "init"]
     subprocess.run(init, cwd=root, check=True, capture_output=True)
     example = Path(__file__).resolve().parents[1] / "server.example.toml"
     assert config.read_bytes() == example.read_bytes()
@@ -47,7 +47,7 @@ def main(root, address):
     user_a, user_b, other = [root / a for a in ("client-a", "client-b", "other")]
     env = {"BUDDY_ALLOW_FILE_CREDENTIAL": "true"}
     password = secrets.token_urlsafe(24)
-    server = subprocess.Popen([binary, "serve"], cwd=root, stderr=subprocess.PIPE, text=True)
+    server = subprocess.Popen([binary, "server", "serve"], cwd=root, stderr=subprocess.PIPE, text=True)
     try:
         line = server.stderr.readline().strip()
         assert line.startswith("Buddy listening on "), line
@@ -57,7 +57,7 @@ def main(root, address):
         for profile, name, host, new in [(user_a, "player", "desktop", True), (user_b, "player", "deck", False), (other, "guest", "guest-device", True)]:
             args = ["login", url, name, "--device", host, "--password-stdin"]
             if new:
-                args += ["--invite", cli(profile, "invite", "--config", config).strip()]
+                args += ["--invite", cli(profile, "server", "invite", "--config", config).strip()]
             cli(profile, *args, input=password + "\n", extra=env)
         a, b, g = [root / a for a in ("world A", "world B", "guest world")]
         for d in (a,b,g):

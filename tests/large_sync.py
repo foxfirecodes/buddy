@@ -16,7 +16,7 @@ with tempfile.TemporaryDirectory(dir=Path("target").resolve()) as name:
     assert shutil.disk_usage(root).free > 12 * 1024**3
     cfg = root / "server.toml"
     cfg.write_text('listen="127.0.0.1:0"\ndatabase="bench.sqlite"\n')
-    server = subprocess.Popen([binary,"serve","--config",str(cfg)],stderr=subprocess.PIPE,text=True)
+    server = subprocess.Popen([binary,"server","serve","--config",str(cfg)],stderr=subprocess.PIPE,text=True)
     addr=server.stderr.readline().strip().split()[-1]
     sent=received=0
 
@@ -59,7 +59,7 @@ with tempfile.TemporaryDirectory(dir=Path("target").resolve()) as name:
         a,b=root/"world-a",root/"world-b"
         a.mkdir();b.mkdir()
         for device,folder in [("a",a),("b",b)]:
-            invite=["--invite",cmd(device,"invite","--config",cfg).strip()] if device=="a" else []
+            invite=["--invite",cmd(device,"server","invite","--config",cfg).strip()] if device=="a" else []
             cmd(device,"login",url,"bench","--password-stdin",*invite,data="test-passphrase\n")
             cmd(device,"setup","big",folder)
         with (a/"regions").open("wb") as f:

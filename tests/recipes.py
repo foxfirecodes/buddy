@@ -13,7 +13,7 @@ def run(root):
     cfg = root / "server.toml"
     cfg.write_text('listen="127.0.0.1:0"\ndatabase="server.sqlite"\n')
     def start():
-        server = subprocess.Popen([binary, "serve", "--config", cfg], stderr=subprocess.PIPE, text=True)
+        server = subprocess.Popen([binary, "server", "serve", "--config", cfg], stderr=subprocess.PIPE, text=True)
         return server, server.stderr.readline().split()[-1]
     server, addr = start()
     a, b = root / "a", root / "b"
@@ -33,7 +33,7 @@ def run(root):
         env = {"BUDDY_STEAM_ROOT": str(steam), "BUDDY_ALLOW_FILE_CREDENTIAL":"true"}
         def call(home, *args, **kwargs):
             return cli(home, *args, extra=env, **kwargs)
-        invite = call(a, "invite", "--config", cfg).strip()
+        invite = call(a, "server", "invite", "--config", cfg).strip()
         for profile in (a,b):
             call(profile,"login","http://"+addr,"player","--password-stdin","--device",profile.name,
                  *(["--invite",invite] if profile == a else []),input="test-password\n")

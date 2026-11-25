@@ -21,7 +21,7 @@ use std::{
 };
 
 mod releases;
-pub use releases::publish_release;
+pub use releases::{publish_release, status};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -122,14 +122,22 @@ impl Store {
         c.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
         Ok(c)
     }
-    fn open(path: &Path) -> Result<(Self, Config)> {
-        let cfg: Config =
-            toml::from_str(&fs::read_to_string(path).context("open server settings")?)?;
+    fn from_config(path: &Path) -> Result<(Self, Config)> {
+        let settings = fs::read_to_string(path).with_context(|| {
+            format!(
+                "open {} (use --config PATH or run buddy server init for a new server)",
+                path.display()
+            )
+        })?;
+        let cfg: Config = toml::from_str(&settings).context("parse server settings")?;
         let db = path.parent().unwrap_or(Path::new(".")).join(&cfg.database);
-        if let Some(parent) = db.parent() {
+        Ok((Self(db, cfg.account_quota_bytes), cfg))
+    }
+    fn open(path: &Path) -> Result<(Self, Config)> {
+        let (store, cfg) = Self::from_config(path)?;
+        if let Some(parent) = store.0.parent() {
             fs::create_dir_all(parent)?;
         }
-        let store = Self(db, cfg.account_quota_bytes);
         let c = store.connection()?;
         c.execute_batch("PRAGMA journal_mode=WAL;
           CREATE TABLE IF NOT EXISTS accounts(name TEXT PRIMARY KEY,password TEXT NOT NULL);

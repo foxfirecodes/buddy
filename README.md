@@ -4,7 +4,9 @@ Buddy syncs selected game saves and settings between devices. The native Rust ap
 
 To build the sync app from source, run `cargo build --locked --release -p buddy` from the repository root. Open `target/release/buddy` on Linux or `target\release\buddy.exe` on Windows to start the graphical client. To install `buddy` into Cargo’s bin directory, run `cargo install --locked --path buddy`.
 
-For headless hosting, run `buddy init-server` in the directory where you want to keep your server settings. Edit `listen` in `server.toml`, then run `buddy invite` and `buddy serve`. Plain HTTP on a non-loopback address prints a warning and starts normally.
+For headless hosting, run `buddy server init` in the directory where you want to keep your server settings. Edit `listen` in `server.toml`, then run `buddy server invite` and `buddy server serve`. Plain HTTP on a non-loopback address prints a warning and starts normally.
+
+Run `buddy server status` on the host to see the configured listener, database path, public release signing key, and latest published build for each platform. It also works when the server is stopped. For a different settings file, use `buddy server status --config PATH`.
 
 - [Set up Buddy on your home network](docs/onboarding.md) to host an HTTPS server, pair a second device, and preview the files you want to sync.
 - [Run the sync client and server](docs/sync.md) for setup, a two-device walkthrough, backups, and recovery.
@@ -30,17 +32,17 @@ Run `mise trust` once in your checkout. If your Rust toolchain is missing the ch
 Run `mise run stage` on your Linux build machine, then copy `server-stage/` beside `server.toml` on your server. The same `buddy-linux-x86_64` executable runs the server and every Linux or Steam Deck client. From the directory containing `server.toml`, publish each platform you use.
 
 ```sh
-./server-stage/buddy-linux-x86_64 publish-release --config server.toml linux-x86_64 ./server-stage/buddy-linux-x86_64
-./server-stage/buddy-linux-x86_64 publish-release --config server.toml windows-x86_64 ./server-stage/buddy-windows-x86_64.exe
+./server-stage/buddy-linux-x86_64 server publish-release --config server.toml linux-x86_64 ./server-stage/buddy-linux-x86_64
+./server-stage/buddy-linux-x86_64 server publish-release --config server.toml windows-x86_64 ./server-stage/buddy-windows-x86_64.exe
 ```
 
 On a signed-in client, open **Settings → Pair a device**, choose the destination platform, and copy the command. Paste it into a shell on Linux or PowerShell on Windows. The command verifies and installs the build, links the device to your account, then offers **Add Buddy to Steam**. Anyone with the command can join your account once within ten minutes. With plain HTTP, use a trusted network, since the connection carries credentials.
 
-The terminal equivalent is `buddy install-command linux-x86_64` or `buddy install-command windows-x86_64`. The first time an existing HTTP client pairs or updates, enter the release signing key printed on the server by `publish-release`. In the CLI, add `--trust-key KEY`. Paired HTTPS clients use their existing server certificate. The new device receives the trusted signing key in the copied command.
+The terminal equivalent is `buddy install-command linux-x86_64` or `buddy install-command windows-x86_64`. The first time an existing HTTP client pairs or updates, enter the release signing key shown by `buddy server status` on the host. In the CLI, add `--trust-key KEY`. Paired HTTPS clients use their existing server certificate. The new device receives the trusted signing key in the copied command.
 
 Linux installs to `~/.local/bin/buddy` by default. If that directory is outside your PATH and `~/bin` is already on it, the installer uses `~/bin`. You can set `XDG_BIN_HOME` to choose another location. If the chosen directory is outside your PATH, the installer prints a command to add it. Windows installs to `%LOCALAPPDATA%\Programs\Buddy\buddy.exe` and adds that directory to the user PATH for new terminals. The installer uses the OS credential store. A headless Linux device can explicitly opt into private-file credentials with `export BUDDY_ALLOW_FILE_CREDENTIAL=true` before running the command.
 
-To roll out a new build, repeat `publish-release` on the host. On each client choose **Settings → Update from server…** or run `buddy update`. Buddy verifies the release and updates the installed executable in place. Back up the host database and its adjacent `<database filename>.releases` directory together. That directory contains the published binaries and the private signing key clients trust.
+To roll out a new build, repeat `buddy server publish-release` on the host. On each client choose **Settings → Update from server…** or run `buddy update`. Buddy verifies the release and updates the installed executable in place. Back up the host database and its adjacent `<database filename>.releases` directory together. That directory contains the published binaries and the private signing key clients trust.
 
 ## Buddy launch probe
 

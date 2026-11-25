@@ -35,6 +35,52 @@ fn signing_key(dir: &Path) -> Result<Ed25519KeyPair> {
     Ed25519KeyPair::from_pkcs8(&fs::read(path)?).map_err(|_| anyhow!("invalid release signing key"))
 }
 
+pub fn status(config: &Path) -> Result<String> {
+    use std::fmt::Write;
+    let (store, cfg) = Store::from_config(config)?;
+    let protocol = if cfg.tls.is_some() { "https" } else { "http" };
+    let mut report = format!(
+        "Configured listener: {protocol}://{}\nDatabase: {}",
+        cfg.listen,
+        store.0.display()
+    );
+    let mut signer = None;
+    if store.0.try_exists()? {
+        let db = Connection::open_with_flags(&store.0, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("read server database {}", store.0.display()))?;
+        if db.table_exists(None, "releases")? {
+            let mut stmt = db.prepare(
+                "SELECT platform, manifest FROM releases WHERE (platform, generation) IN
+                 (SELECT platform, MAX(generation) FROM releases GROUP BY platform) ORDER BY platform",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let platform: String = row.get(0)?;
+                let manifest: SignedRelease = serde_json::from_str(&row.get::<_, String>(1)?)?;
+                manifest.verify(&platform)?;
+                if let Some(key) = &signer {
+                    ensure!(
+                        key == &manifest.signer,
+                        "published releases have different signing keys"
+                    );
+                } else {
+                    write!(report, "\nRelease signing key: {}", manifest.signer)?;
+                    signer = Some(manifest.signer);
+                }
+                write!(
+                    report,
+                    "\n{platform}: release {}",
+                    manifest.release.generation
+                )?;
+            }
+        }
+    }
+    if signer.is_none() {
+        report.push_str("\nNo published releases. Run buddy server publish-release to publish the first build and see its signing key.");
+    }
+    Ok(report)
+}
+
 pub fn publish_release(config: &Path, platform: &str, binary: &Path) -> Result<String> {
     ensure!(
         platform_ok(platform),
@@ -165,7 +211,7 @@ async fn latest(
                 denied(
                     StatusCode::NOT_FOUND,
                     &format!(
-                        "on the host, run buddy publish-release --config server.toml {platform} {}",
+                        "on the host, run buddy server publish-release --config server.toml {platform} {}",
                         if platform == "linux-x86_64" {
                             "/path/to/portable/buddy"
                         } else {

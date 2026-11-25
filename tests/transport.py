@@ -85,7 +85,7 @@ def proxy_handler(upstream, faults):
 def main(root):
     cfg = root / "server.toml"
     cfg.write_text('listen="127.0.0.1:0"\ndatabase="store.sqlite"\n')
-    server = subprocess.Popen([binary, "serve", "--config", cfg], stderr=subprocess.PIPE, text=True)
+    server = subprocess.Popen([binary, "server", "serve", "--config", cfg], stderr=subprocess.PIPE, text=True)
     proxy = None
     try:
         startup = server.stderr.readline()
@@ -98,7 +98,7 @@ def main(root):
         world, witness = root / "world A", root / "world B"
         for profile, folder in [(a, world), (b, witness)]:
             folder.mkdir()
-            invite = ["--invite", cli(profile, "invite", "--config", cfg).strip()] if profile == a else []
+            invite = ["--invite", cli(profile, "server", "invite", "--config", cfg).strip()] if profile == a else []
             cli(profile, "login", url, "tester", "--device", profile.name, "--private-file-credential",
                 "--password-stdin", *invite, input="test-password\n")
             cli(profile, "setup", "world", folder)

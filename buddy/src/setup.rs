@@ -60,6 +60,7 @@ impl ReviewBase {
 }
 
 pub struct ReviewedSetup {
+    pub ignores: BTreeMap<String, BTreeSet<String>>,
     pub title: String,
     pub approved: Vec<(Selection, ReviewedBinding)>,
     pub removed: Vec<String>,
@@ -291,6 +292,15 @@ pub fn save_review(local: &Local, base: &ReviewBase, edits: ReviewedSetup) -> Re
         let binding = reviewed.resolve_with_created(&sel.path, &sel.kind, &mut created)?;
         draft.bind(sel, binding, &platform, &available)?;
     }
+    for (name, rules) in edits.ignores {
+        draft
+            .desired
+            .recipe
+            .slots
+            .get_mut(&name)
+            .context("ignore location is missing; reopen setup")?
+            .set_ignores(rules)?;
+    }
     validate_review(
         &draft.desired.recipe,
         &s.bindings,
@@ -417,6 +427,7 @@ impl Draft {
             .or_insert_with(|| Slot {
                 kind: sel.kind.clone(),
                 codec: raw_codec(),
+                ignores: Default::default(),
                 settings: sel.settings,
                 source: sel.source,
                 locations: BTreeMap::new(),
@@ -516,6 +527,13 @@ fn apply(local: &Local, api: &Api, s: &mut Setup, remote: &GameInfo, ui: Interfa
             && r.kind == slot.kind
         {
             let mut merged = r.clone();
+            let base_rules = prior.map(|s| s.ignores.clone()).unwrap_or_default();
+            let mut rules = r.ignores.clone();
+            for rule in base_rules.difference(&slot.ignores) {
+                rules.remove(rule);
+            }
+            rules.extend(slot.ignores.difference(&base_rules).cloned());
+            merged.set_ignores(rules)?;
             merged.settings = field(
                 &format!("{name} settings tag"),
                 &prior.is_some_and(|s| s.settings),
@@ -582,6 +600,9 @@ fn apply(local: &Local, api: &Api, s: &mut Setup, remote: &GameInfo, ui: Interfa
         remote.revision
     };
     if let Some(edits) = &d.device_edits {
+        if !edits.removed.is_empty() {
+            s.offline_prep = None;
+        }
         s.bindings.retain(|name, _| !edits.removed.contains(name));
         if s.bindings.is_empty() && d.bindings.is_empty() {
             s.bindings_cleared = true;
@@ -592,6 +613,9 @@ fn apply(local: &Local, api: &Api, s: &mut Setup, remote: &GameInfo, ui: Interfa
     for (name, b) in &d.bindings {
         if s.bindings.get(name).is_some_and(|old| old != b) {
             s.base = None;
+        }
+        if s.bindings.get(name) != Some(b) {
+            s.offline_prep = None;
         }
         s.bindings.insert(name.clone(), b.clone());
     }
@@ -657,19 +681,76 @@ fn rescope(s: &mut Setup) {
 // Callers with pending sessions archive changes to retired slots before adopting
 // the recipe. Each remaining session keeps its own comparison base and order.
 pub fn accept_recipe(s: &mut Setup, info: GameInfo) {
-    let had_bindings = !s.bindings.is_empty();
+    let prior_count = s.bindings.len();
     s.bindings
         .retain(|name, _| info.recipe.slots.contains_key(name));
-    if had_bindings && s.bindings.is_empty() {
+    if prior_count > 0 && s.bindings.is_empty() {
         s.bindings_cleared = true;
         s.approved_proton_prefix = None;
         s.needs_first_pull = false;
+    }
+    let changed_scope = prior_count != s.bindings.len()
+        || s.bindings.keys().any(|name| {
+            s.recipe.slots.get(name).map(|slot| &slot.ignores)
+                != info.recipe.slots.get(name).map(|slot| &slot.ignores)
+        });
+    if s.bindings.is_empty()
+        || (changed_scope
+            && matches!(
+                s.offline_prep,
+                Some(crate::local::OfflinePrep::Ready { .. })
+            ))
+    {
+        s.offline_prep = None;
     }
     s.recipe = info.recipe;
     s.revision = info.revision;
     s.shared = info.shared;
     s.retired_slots = info.retired_slots;
     rescope(s);
+}
+pub fn set_ignore(
+    local: &Local,
+    game: &str,
+    path: &str,
+    ignore: bool,
+    reviewed: Option<(&str, i64)>,
+) -> Result<()> {
+    let c = local.credentials()?;
+    let scope = local.scope(&c);
+    ensure!(
+        reviewed.is_none_or(|(account, _)| account == scope),
+        "Account changed. Reopen this game."
+    );
+    let _lock = local.lock(&format!("{scope}:{game}"))?;
+    let mut s = local.setup(&c, game)?;
+    ensure!(
+        idle(&s) && s.draft.is_none(),
+        "Finish pending sync and recipe edits before changing ignores."
+    );
+    let api = Api::new(c.clone())?;
+    let mut remote = api
+        .rpc::<Vec<GameInfo>>(Action::Games)?
+        .into_iter()
+        .find(|g| g.recipe.game == game)
+        .context("Recipe unavailable. Refresh the library.")?;
+    ensure!(
+        reviewed.is_none_or(|(_, rev)| rev == remote.revision),
+        "Recipe changed. Reopen the game to review it."
+    );
+    let (name, relative) = logical_path(path);
+    let slot = remote
+        .recipe
+        .slots
+        .get_mut(name)
+        .context("Location was removed. Reopen the recipe.")?;
+    if slot.edit_ignore(relative, ignore)? {
+        remote.recipe.validate()?;
+        remote.revision = api.rpc(Action::SaveRecipe { recipe: remote.recipe.clone(), expected: remote.revision, shared: remote.shared })
+            .context("Couldn’t update the recipe. Close active games and check that the server supports ignores.")?;
+    }
+    accept_recipe(&mut s, remote);
+    local.save(&c, &s)
 }
 pub fn remove_slot(local: &Local, base: &ReviewBase, slot: &str) -> Result<()> {
     let c = local.credentials()?;
@@ -717,6 +798,7 @@ pub fn unbind(local: &Local, game: &str, slot: &str) -> Result<()> {
         s.approved_proton_prefix = None;
         s.needs_first_pull = false;
     }
+    s.offline_prep = None;
     rescope(&mut s);
     local.save(&c, &s)
 }

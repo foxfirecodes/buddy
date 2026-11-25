@@ -188,6 +188,17 @@ enum Cmd {
         #[arg(last = true, required = true)]
         command: Vec<OsString>,
     },
+    /// Show the file changes recorded for a backup.
+    Changes { game: String, id: i64 },
+    /// Ignore an exact logical file or folder on every device using this recipe.
+    Ignore { game: String, path: String },
+    /// Resume syncing a previously ignored path.
+    Unignore { game: String, path: String },
+    /// Sync these games and prepare this device to play them offline.
+    PrepareOffline {
+        #[arg(required = true)]
+        games: Vec<String>,
+    },
     /// List saved versions and permanent backups.
     Backups { game: String },
     /// Sync current files and pin a permanent backup.
@@ -232,6 +243,7 @@ enum SteamAction {
 }
 fn options() -> RunOptions {
     RunOptions {
+        prepare_offline: false,
         command: vec![],
         manual: false,
         restore: None,
@@ -503,6 +515,9 @@ fn dispatch(args: Args) -> Result<i32> {
                 Cmd::Import { game, recipe_hash } => setup::import(&l, &game, &recipe_hash)?,
                 Cmd::Status { game } => {
                     let s = l.setup(&l.credentials()?, &game)?;
+                    if let Some(prep) = &s.offline_prep {
+                        println!("{prep}");
+                    }
                     if s.draft.is_some() {
                         println!("Recipe edits queued on this device");
                     }
@@ -560,6 +575,28 @@ fn dispatch(args: Args) -> Result<i32> {
                             ..options()
                         },
                         cli_decisions(interactive),
+                    );
+                }
+                Cmd::Changes { game, id } => {
+                    Api::new(l.credentials()?)?
+                        .backup_changes(&game, id)?
+                        .print();
+                }
+                Cmd::Ignore { game, path } => setup::set_ignore(&l, &game, &path, true, None)?,
+                Cmd::Unignore { game, path } => setup::set_ignore(&l, &game, &path, false, None)?,
+                Cmd::PrepareOffline { games } => {
+                    let scope = l.scope(&l.credentials()?);
+                    let mut failures = 0;
+                    session::prepare_games(&l, &games, &scope, |game, result| match result {
+                        Ok(status) => println!("{game} · {status}"),
+                        Err(error) => {
+                            failures += 1;
+                            eprintln!("{game} · {error:#}");
+                        }
+                    })?;
+                    anyhow::ensure!(
+                        failures == 0,
+                        "{failures} game(s) need attention before offline play"
                     );
                 }
                 Cmd::Backups { game } => {

@@ -18,6 +18,7 @@ description = "Exercise two-device sync against a disposable Linux server (requi
 run = [
   "cargo build --locked --release -p buddy",
   'python3 tests/sync.py "${CARGO_TARGET_DIR:-target}/release/buddy"',
+  'python3 tests/workflows.py "${CARGO_TARGET_DIR:-target}/release/buddy"',
 ]
 
 [tasks."build:linux"]

@@ -72,12 +72,89 @@ pub struct Slot {
     pub kind: Kind,
     #[serde(default = "raw_codec")]
     pub codec: String,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub ignores: BTreeSet<String>,
     #[serde(default)]
     pub settings: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(default)]
     pub locations: BTreeMap<String, Location>,
+}
+// Older clients reject this codec before handling a tree with excluded paths.
+pub const FILTERED_CODEC: &str = "raw-with-ignores-v1";
+fn folded_path(path: &str) -> String {
+    path.nfc().collect::<String>().to_lowercase()
+}
+fn at_or_below(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+impl Slot {
+    pub fn ignores_path(&self, relative: &str) -> bool {
+        if self.ignores.is_empty() {
+            return false;
+        }
+        let path = folded_path(relative);
+        self.ignores
+            .iter()
+            .any(|rule| at_or_below(&path, &folded_path(rule)))
+    }
+    pub fn contains_ignore(&self, relative: &str) -> bool {
+        if self.ignores.is_empty() || relative.is_empty() {
+            return false;
+        }
+        let path = folded_path(relative);
+        self.ignores
+            .iter()
+            .any(|rule| at_or_below(&folded_path(rule), &path))
+    }
+    pub fn set_ignores(&mut self, rules: BTreeSet<String>) -> Result<()> {
+        for rule in &rules {
+            self.validate_rule(rule)?;
+        }
+        self.codec = if rules.is_empty() {
+            raw_codec()
+        } else {
+            FILTERED_CODEC.into()
+        };
+        let mut seen = BTreeSet::new();
+        self.ignores = rules
+            .into_iter()
+            .filter(|rule| seen.insert(folded_path(rule)))
+            .collect();
+        Ok(())
+    }
+    pub fn edit_ignore(&mut self, path: &str, add: bool) -> Result<bool> {
+        self.validate_rule(path)?;
+        let mut rules = self.ignores.clone();
+        let name = folded_path(path);
+        if let Some(existing) = rules.iter().find(|rule| folded_path(rule) == name).cloned() {
+            if add {
+                return Ok(false);
+            }
+            rules.remove(&existing);
+        } else if add {
+            rules.insert(path.into());
+        } else {
+            return Ok(false);
+        }
+        self.set_ignores(rules)?;
+        Ok(true)
+    }
+    pub fn validate_rule(&self, rule: &str) -> Result<()> {
+        if self.kind == Kind::File {
+            ensure!(rule.is_empty(), "a file location has no child paths");
+        } else {
+            ensure!(rule.len() <= 4096, "ignore path is too long");
+            for part in rule.split('/') {
+                component(part)?;
+            }
+        }
+        Ok(())
+    }
 }
 pub fn raw_codec() -> String {
     "raw-v1".to_owned()
@@ -102,10 +179,22 @@ impl Recipe {
         for (name, slot) in &self.slots {
             ensure!(key(name), "invalid slot ID");
             ensure!(
-                slot.codec == "raw-v1",
+                slot.codec
+                    == if slot.ignores.is_empty() {
+                        "raw-v1"
+                    } else {
+                        FILTERED_CODEC
+                    },
                 "unsupported file format {} for {name}",
                 slot.codec
             );
+            ensure!(
+                slot.ignores.len() <= 1024,
+                "too many ignore rules for {name}"
+            );
+            for rule in &slot.ignores {
+                slot.validate_rule(rule)?;
+            }
             for (runtime, loc) in &slot.locations {
                 ensure!(key(runtime) && key(&loc.root), "invalid location");
                 if !loc.relative.is_empty() {
@@ -134,6 +223,9 @@ pub enum Entry {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tree(pub BTreeMap<String, Entry>);
+pub fn logical_path(path: &str) -> (&str, &str) {
+    path.split_once('/').unwrap_or((path, ""))
+}
 pub fn portable_path(name: &str, folded: &mut BTreeSet<String>) -> Result<()> {
     ensure!(name.len() <= 4096, "path too long");
     ensure!(
@@ -146,7 +238,12 @@ impl Tree {
     pub fn project(&self, scope: &Recipe) -> Tree {
         let mut entries = BTreeMap::new();
         for (k, v) in &self.0 {
-            if scope.slots.contains_key(k.split('/').next().unwrap_or("")) {
+            let (slot, relative) = logical_path(k);
+            if scope
+                .slots
+                .get(slot)
+                .is_some_and(|s| !s.ignores_path(relative))
+            {
                 entries.insert(k.clone(), v.clone());
             }
         }
@@ -156,7 +253,36 @@ impl Tree {
                 entries.entry(name.clone()).or_insert(Entry::Directory);
             }
         }
-        Tree(entries)
+        let mut tree = Tree(entries);
+        tree.prune_ignore_parents(scope);
+        tree
+    }
+    // A directory kept only to hold an ignored descendant is local scaffolding.
+    pub fn prune_ignore_parents(&mut self, recipe: &Recipe) {
+        if recipe.slots.values().all(|s| s.ignores.is_empty()) {
+            return;
+        }
+        let candidates: Vec<_> = self
+            .0
+            .iter()
+            .rev()
+            .filter_map(|(path, entry)| {
+                let (name, relative) = logical_path(path);
+                (*entry == Entry::Directory && recipe.slots.get(name)?.contains_ignore(relative))
+                    .then(|| path.clone())
+            })
+            .collect();
+        for path in candidates {
+            let prefix = format!("{path}/");
+            if !self
+                .0
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|(p, _)| p.starts_with(&prefix))
+            {
+                self.0.remove(&path);
+            }
+        }
     }
     pub fn overlay(&self, scope: &Recipe, selected: &Tree) -> Tree {
         let mut full = self.clone();
@@ -265,6 +391,86 @@ impl Tree {
             if count == 1 { "file" } else { "files" },
             if bytes == 1 { "byte" } else { "bytes" }
         )
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Comparison {
+    First,
+    Previous(i64),
+    EarlierRetained(i64),
+    Contents,
+}
+impl std::fmt::Display for Comparison {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::First => write!(f, "First backup"),
+            Self::Previous(id) => write!(f, "Compared with backup #{id}"),
+            Self::EarlierRetained(id) => write!(f, "Compared with earlier retained backup #{id}"),
+            Self::Contents => write!(f, "Backup contents · previous version unavailable"),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChangeKind {
+    Added,
+    Modified,
+    Removed,
+    Present,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    pub kind: ChangeKind,
+    pub directory: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackupChanges {
+    pub comparison: Comparison,
+    pub entries: Vec<FileChange>,
+}
+impl BackupChanges {
+    pub fn print(&self) {
+        println!("{}", self.comparison);
+        for entry in &self.entries {
+            println!("{:?}\t{}", entry.kind, entry.path);
+        }
+    }
+
+    pub fn between(before: &Tree, after: &Tree, comparison: Comparison) -> Self {
+        let mut entries = Vec::new();
+        for (path, entry) in &after.0 {
+            let kind = match before.0.get(path) {
+                None if matches!(comparison, Comparison::Contents) => ChangeKind::Present,
+                None => ChangeKind::Added,
+                Some(previous) => match (previous, entry) {
+                    (Entry::Directory, Entry::Directory) => continue,
+                    (Entry::File { hash: old, .. }, Entry::File { hash, .. }) if old == hash => {
+                        continue;
+                    }
+                    _ => ChangeKind::Modified,
+                },
+            };
+            entries.push(FileChange {
+                path: path.clone(),
+                kind,
+                directory: *entry == Entry::Directory,
+            });
+        }
+        for (path, entry) in &before.0 {
+            if !after.0.contains_key(path) {
+                entries.push(FileChange {
+                    path: path.clone(),
+                    kind: ChangeKind::Removed,
+                    directory: *entry == Entry::Directory,
+                });
+            }
+        }
+        entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        Self {
+            comparison,
+            entries,
+        }
     }
 }
 
@@ -382,6 +588,10 @@ pub enum Action {
         local: Tree,
         time: i64,
         op: String,
+    },
+    BackupChanges {
+        game: String,
+        id: i64,
     },
     Backups {
         game: String,

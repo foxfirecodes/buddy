@@ -305,6 +305,7 @@ mod tests {
             settings: false,
             source: None,
             codec: crate::model::raw_codec(),
+            ignores: Default::default(),
             locations: BTreeMap::new(),
         };
         slot.locations.insert(

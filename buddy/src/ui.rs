@@ -35,12 +35,15 @@ pub(crate) fn native(size: [f32; 2]) -> eframe::NativeOptions {
 
 use crate::phase;
 mod artwork;
+mod history;
+mod offline;
 mod onboarding;
 mod review;
 use onboarding::JoinStep;
 
 struct Detail {
     account_scope: String,
+    recipe_revision: i64,
     game: String,
     own: Option<Recipe>,
     retired_slots: std::collections::BTreeSet<String>,
@@ -77,6 +80,9 @@ enum Event {
     ReviewStaged(anyhow::Error),
     Games(Vec<Row>),
     Detail(Box<Detail>),
+    History(history::History),
+    OfflinePicker(offline::Picker),
+    Prepared(String, Result<String>),
     Done(String),
     Notice(String),
     ReleaseDialog(desktop::ReleaseDialog),
@@ -111,6 +117,8 @@ struct App {
     launcher: Launcher,
     launcher_args: String,
     detail: Option<Detail>,
+    history: Option<history::History>,
+    offline_picker: Option<offline::Picker>,
     note: String,
     error: Option<String>,
 }
@@ -262,6 +270,8 @@ impl App {
             launcher: Launcher::default(),
             launcher_args: String::new(),
             detail: None,
+            history: None,
+            offline_picker: None,
             note: String::new(),
             error: None,
         };
@@ -355,6 +365,7 @@ impl App {
             };
             let mut detail = Detail {
                 account_scope: l.scope(&c),
+                recipe_revision: own_revision.unwrap_or(0),
                 detected: BTreeMap::new(),
                 baseline,
                 device,
@@ -385,6 +396,7 @@ impl App {
         self.title.clear();
         self.review = None;
         self.detail = None;
+        self.history = None;
         self.note.clear();
         self.error = None;
         self.page = GamePage::Overview;
@@ -409,6 +421,11 @@ impl App {
             });
         });
         ui.add_space(6.);
+        if self.games.iter().any(|r| r.device == DeviceState::Ready)
+            && ui.button("Prepare for offline play…").clicked()
+        {
+            self.job(|local| Ok(Event::OfflinePicker(offline::Picker::load(&local)?)));
+        }
         ui.add(
             egui::TextEdit::singleline(&mut self.filter)
                 .hint_text("Find a game")
@@ -790,6 +807,25 @@ impl App {
                         if b.head { "current" } else { "" },
                         b.reason
                     ));
+                    if ui
+                        .selectable_label(
+                            self.history.as_ref().is_some_and(|h| h.matches(game, b.id)),
+                            "What changed?",
+                        )
+                        .clicked()
+                    {
+                        if self.history.as_ref().is_some_and(|h| h.matches(game, b.id)) {
+                            self.history = None;
+                        } else if let Some(d) = &self.detail {
+                            let (account, game, id) =
+                                (d.account_scope.clone(), game.to_owned(), b.id);
+                            self.job(move |local| {
+                                Ok(Event::History(history::History::load(
+                                    &local, &account, game, id,
+                                )?))
+                            });
+                        }
+                    }
                     if !b.head && ui.small_button("Restore").clicked() {
                         self.sync(Some(b.id), false);
                     }
@@ -813,6 +849,20 @@ impl App {
                         });
                     }
                 });
+                if let Some(h) = self.history.as_ref().filter(|h| h.matches(game, b.id))
+                    && let Some(d) = self.detail.as_ref()
+                    && let Some(recipe) = d.own.as_ref()
+                    && let Some((path, folder)) = h.show(ui, recipe)
+                {
+                    let (game, account, rev) =
+                        (game.to_owned(), d.account_scope.clone(), d.recipe_revision);
+                    let backup = b.id;
+                    self.job(move |local| {
+                        history::confirm_ignore(&local, &account, &game, backup, &path, folder)?;
+                        setup::set_ignore(&local, &game, &path, true, Some((&account, rev)))?;
+                        Ok(Event::Done("Recipe updated".into()))
+                    });
+                }
             }
         }
     }
@@ -930,7 +980,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.artwork.poll(ctx);
         if let Ok(event) = self.rx.try_recv() {
-            self.busy = false;
+            self.busy = matches!(&event, Ok(Event::Prepared(..)));
             match event {
                 Ok(Event::Signed(credentials)) => {
                     self.remember_profile(&credentials);
@@ -949,6 +999,9 @@ impl eframe::App for App {
                     }
                     self.join_step = step;
                 }
+                Ok(Event::History(view)) => self.history = Some(view),
+                Ok(Event::OfflinePicker(picker)) => self.offline_picker = Some(picker),
+                Ok(Event::Prepared(game, result)) => self.prepared_result(game, result),
                 Ok(Event::Games(g)) => self.games = g,
                 Ok(Event::Catalog(msg)) => {
                     if !self.selected.is_empty() {
@@ -1182,6 +1235,7 @@ impl eframe::App for App {
                 });
             });
         self.show_device_dialog(ctx);
+        self.show_offline_picker(ctx);
         if self.busy {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -1206,7 +1260,13 @@ pub fn tui(l: &Local) -> Result<()> {
     loop {
         let item = Select::new(
             "Buddy",
-            vec!["Games", "Sign in", "Add non-Steam game", "Quit"],
+            vec![
+                "Games",
+                "Prepare for offline play",
+                "Sign in",
+                "Add non-Steam game",
+                "Quit",
+            ],
         )
         .prompt()?;
         if item == "Quit" {
@@ -1259,6 +1319,10 @@ pub fn tui(l: &Local) -> Result<()> {
             )?;
             continue;
         }
+        if item == "Prepare for offline play" {
+            offline::prepare_terminal(l)?;
+            continue;
+        }
         let (game, title) = if item == "Games" {
             let rows = setup::games(l)?;
             if rows.is_empty() {
@@ -1292,6 +1356,7 @@ pub fn tui(l: &Local) -> Result<()> {
                 "Back up now",
                 "History",
                 "Share and retention",
+                "Ignore or include a path",
                 "Back",
             ],
         )
@@ -1330,6 +1395,15 @@ pub fn tui(l: &Local) -> Result<()> {
                     Interface::Terminal,
                 )?;
             }
+            "Ignore or include a path" => {
+                let path = Text::new("Path in recipe (e.g. saves/player/statistics)").prompt()?;
+                let action =
+                    Select::new("On all devices", vec!["Cancel", "Ignore", "Include again"])
+                        .prompt()?;
+                if action != "Cancel" {
+                    setup::set_ignore(l, &game, &path, action == "Ignore", None)?;
+                }
+            }
             "Share and retention" => {
                 let s = l.setup(&l.credentials()?, &game)?;
                 let share = Confirm::new("Publish this file recipe?")
@@ -1358,10 +1432,17 @@ pub fn tui(l: &Local) -> Result<()> {
                 let id = list[i].id;
                 match Select::new(
                     "Action",
-                    vec!["Back", "Keep indefinitely", "Restore", "Delete"],
+                    vec![
+                        "Back",
+                        "What changed?",
+                        "Keep indefinitely",
+                        "Restore",
+                        "Delete",
+                    ],
                 )
                 .prompt()?
                 {
+                    "What changed?" => api.backup_changes(&game, id)?.print(),
                     "Keep indefinitely" => api.rpc::<()>(Action::Pin { game, id })?,
                     "Restore" => {
                         synchronize(

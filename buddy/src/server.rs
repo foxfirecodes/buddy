@@ -145,6 +145,7 @@ impl Store {
           CREATE TABLE IF NOT EXISTS objects(account TEXT,hash TEXT,bytes BLOB NOT NULL,touched INTEGER NOT NULL,PRIMARY KEY(account,hash));
           CREATE TABLE IF NOT EXISTS versions(id INTEGER PRIMARY KEY AUTOINCREMENT,account TEXT NOT NULL,game TEXT NOT NULL,origin TEXT NOT NULL,
             created INTEGER NOT NULL,tree TEXT NOT NULL,pin TEXT NOT NULL DEFAULT '',published INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS backup_changes(version INTEGER PRIMARY KEY REFERENCES versions(id) ON DELETE CASCADE,changes TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS history ON versions(account,game,id DESC);
           CREATE TABLE IF NOT EXISTS refs(version INTEGER REFERENCES versions(id) ON DELETE CASCADE,hash TEXT NOT NULL,PRIMARY KEY(version,hash));
           CREATE TABLE IF NOT EXISTS candidates(account TEXT,game TEXT,device TEXT,head INTEGER,hash TEXT,version INTEGER REFERENCES versions(id) ON DELETE CASCADE,
@@ -514,6 +515,28 @@ fn version(c: &Connection, u: &User, g: &str, id: i64) -> Result<Revision> {
         tree: serde_json::from_str(&tree)?,
     })
 }
+fn backup_changes(tx: &Transaction, u: &User, game: &str, id: i64) -> Result<BackupChanges> {
+    let stored: Option<String> = tx.query_row(
+        "SELECT c.changes FROM backup_changes c JOIN versions v ON v.id=c.version WHERE v.account=? AND v.game=? AND v.id=?",
+        params![u.account, game, id], |r| r.get(0)
+    ).optional()?;
+    if let Some(raw) = stored {
+        return Ok(serde_json::from_str(&raw)?);
+    }
+    let current = version(tx, u, game, id)?;
+    // Old databases did not record parentage. Retention can leave gaps in this comparison.
+    let previous: Option<i64> = tx.query_row(
+        "SELECT max(id) FROM versions WHERE account=? AND game=? AND id<? AND published",
+        params![u.account, game, id],
+        |r| r.get(0),
+    )?;
+    let base = previous.map(|id| version(tx, u, game, id)).transpose()?;
+    Ok(BackupChanges::between(
+        &base.map(|r| r.tree).unwrap_or_default(),
+        &current.tree,
+        previous.map_or(Comparison::Contents, Comparison::EarlierRetained),
+    ))
+}
 fn snapshot(
     tx: &Transaction,
     u: &User,
@@ -526,6 +549,19 @@ fn snapshot(
     tree.validate(&g.recipe)?;
     tx.execute("INSERT INTO versions(account,game,origin,created,tree,pin,published) VALUES(?,?,?,?,?,?,?)",params![u.account,g.recipe.game,u.name,time,serde_json::to_string(tree)?,pin,published])?;
     let id = tx.last_insert_rowid();
+    let base = g
+        .head
+        .map(|parent| version(tx, u, &g.recipe.game, parent))
+        .transpose()?;
+    let changes = BackupChanges::between(
+        &base.map(|r| r.tree).unwrap_or_default(),
+        tree,
+        g.head.map_or(Comparison::First, Comparison::Previous),
+    );
+    tx.execute(
+        "INSERT INTO backup_changes(version,changes) VALUES(?,?)",
+        params![id, serde_json::to_string(&changes)?],
+    )?;
     let mut lookup =
         tx.prepare_cached("SELECT length(bytes) FROM objects WHERE account=? AND hash=?")?;
     let mut add = tx.prepare_cached("INSERT INTO refs VALUES(?,?)")?;
@@ -841,6 +877,7 @@ fn apply(tx: &Transaction, u: &User, a: Action) -> Result<Value> {
                             Slot {
                                 kind: kind.clone(),
                                 codec: raw_codec(),
+                                ignores: Default::default(),
                                 settings: false,
                                 source: None,
                                 locations: Default::default(),
@@ -870,6 +907,7 @@ fn apply(tx: &Transaction, u: &User, a: Action) -> Result<Value> {
             };
             remember(tx, u, &op, &fingerprint, id)
         }
+        Action::BackupChanges { game, id } => Ok(json!(backup_changes(tx, u, &game, id)?)),
         Action::Backups { game: g } => {
             let state = game(tx, u, &g)?;
             let mut stmt=tx.prepare("SELECT id,origin,created,pin FROM versions WHERE account=? AND game=? ORDER BY id DESC")?;

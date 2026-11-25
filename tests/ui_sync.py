@@ -269,14 +269,21 @@ def run():
             call(profile,"setup","world",folder)
         (a/"save").write_text("baseline")
         call("A","sync","world");call("B","sync","world")
+        call("A", "prepare-offline", "world")
+        call("A", "sync", "world")  # An online sync does not consume preparation.
         server.terminate();server.wait(timeout=8)
+        refresh = subprocess.run([binary, "prepare-offline", "world"], env=args("A"),
+                                 capture_output=True, text=True, timeout=30)
+        assert refresh.returncode != 0, "preparation must report an unreachable server"
+        assert "Ready" in call("A", "status", "world"), "a failed refresh lost the earlier preparation"
         def play(profile,folder,text):
             return subprocess.Popen([binary,"run","--game","world","--",sys.executable,"-c",
                 "from pathlib import Path; import sys; Path(sys.argv[1]).write_text(sys.argv[2])",str(folder/"save"),text],env=args(profile))
         offline=play("A",a,"offline A")
-        window("Server unreachable",["Left","Return"])
+        assert offline.wait(timeout=15)==0  # Prepared launches skip the offline choice.
+        offline=play("A",a,"offline A")
         assert offline.wait(timeout=15)==0
-        assert "1 queued" in call("A","status","world")
+        assert re.search(r"[1-9][0-9]* queued", call("A","status","world"))
         server,_=start(config)
         (b/"save").write_text("online B");call("B","sync","world")
         def server_head():
@@ -295,7 +302,14 @@ def run():
         assert "0 queued" in call("A","status","world")
         history=call("A","backups","world")
         assert history.count("conflict")==2,history
-        print("PASS graphical offline session, pinned conflict and reconciliation",flush=True)
+        print("PASS prepared offline sessions, pinned conflict and reconciliation",flush=True)
+        server.terminate();server.wait(timeout=8)
+        unprepared=play("A",a,"unprepared offline")
+        window("Server unreachable",["Left","Return"])
+        assert unprepared.wait(timeout=15)==0
+        server,_=start(config)
+        call("A","sync","world")
+        print("PASS preparation is consumed after reconciliation",flush=True)
         login=urllib.request.Request(url+"/v1/login",data=json.dumps({"account":"player","password":"password123","device":"sleeping PC","invite":None}).encode(),headers={"Content-Type":"application/json"})
         with urllib.request.urlopen(login) as r: token=json.load(r)
         holder=rpc(url,token,"acquire",game="world",session="sleeping",takeover=None)["Granted"]["lease"]

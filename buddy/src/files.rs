@@ -262,10 +262,14 @@ impl Root {
         &self,
         slot: &str,
         stage: Option<&str>,
+        rules: &Slot,
         mut visit: impl FnMut(String, PathBuf, cap_std::fs::Metadata) -> Result<()>,
     ) -> Result<()> {
         let mut todo = vec![(slot.to_owned(), self.base.clone())];
         while let Some((logical, path)) = todo.pop() {
+            if rules.ignores_path(logical_path(&logical).1) {
+                continue;
+            }
             let meta = match self.dir.symlink_metadata(&path) {
                 Ok(m) => m,
                 Err(e)
@@ -498,6 +502,7 @@ pub fn preview(
     path: &Path,
     kind: Kind,
     slot: &str,
+    ignores: BTreeSet<String>,
     cancelled: impl Fn() -> bool,
 ) -> Result<Preview> {
     let binding = Binding::new(path, &kind)?;
@@ -515,7 +520,12 @@ pub fn preview(
             slot.to_owned(),
             Slot {
                 kind,
-                codec: raw_codec(),
+                codec: if ignores.is_empty() {
+                    raw_codec()
+                } else {
+                    FILTERED_CODEC.into()
+                },
+                ignores,
                 source: None,
                 settings: false,
                 locations: BTreeMap::new(),
@@ -533,7 +543,7 @@ pub fn preview(
         bytes: 0,
     };
     let mut names = BTreeSet::new();
-    files.roots[slot].walk(slot, None, |logical, _, meta| {
+    files.roots[slot].walk(slot, None, &recipe.slots[slot], |logical, _, meta| {
         ensure!(!cancelled(), "preview cancelled");
         portable_path(&logical, &mut names)?;
         if meta.is_file() {
@@ -691,7 +701,7 @@ impl Files {
         let mut tree = Tree::default();
         let mut stamps = BTreeMap::new();
         for (slot, root) in &self.roots {
-            root.walk(slot, stage, |logical, path, meta| {
+            root.walk(slot, stage, &recipe.slots[slot], |logical, path, meta| {
                 let entry = if meta.is_dir() {
                     Entry::Directory
                 } else {
@@ -711,12 +721,6 @@ impl Files {
             })?;
         }
         tree.validate(recipe)?;
-        if let Some(expected) = expected {
-            ensure!(
-                &tree == expected,
-                "unexpected local edit during restore: file inventory changed"
-            );
-        }
         // Detect additions, removals and edits that occurred elsewhere in the tree during the read.
         for (path, entry) in &tree.0 {
             let (root, rel) = self.where_is(path)?;
@@ -727,9 +731,19 @@ impl Files {
                 );
             }
             if *entry == Entry::Directory {
+                let (slot, relative) = logical_path(path);
                 let actual = dir_names(&root.dir, &rel)?
                     .into_iter()
                     .filter(|s| rel != root.base || Some(s.as_str()) != stage)
+                    .filter(|name| {
+                        let rules = &recipe.slots[slot];
+                        rules.ignores.is_empty()
+                            || !rules.ignores_path(&if relative.is_empty() {
+                                name.clone()
+                            } else {
+                                format!("{relative}/{name}")
+                            })
+                    })
                     .collect::<BTreeSet<_>>();
                 let prefix = format!("{path}/");
                 let expected = tree
@@ -750,13 +764,23 @@ impl Files {
         // File slots may be absent from the entire inventory. Catch a newly appeared
         // slot as well as additions beneath the directories checked above.
         for (slot, root) in &self.roots {
-            if root.kind == Kind::File && !tree.0.contains_key(slot) {
+            if root.kind == Kind::File
+                && !recipe.slots[slot].ignores_path("")
+                && !tree.0.contains_key(slot)
+            {
                 match root.dir.symlink_metadata(&root.base) {
                     Err(e) if e.kind() == ErrorKind::NotFound => (),
                     Err(e) => return Err(e.into()),
                     Ok(_) => bail!("file appeared during capture: {slot}"),
                 }
             }
+        }
+        tree.prune_ignore_parents(recipe);
+        if let Some(expected) = expected {
+            ensure!(
+                &tree == expected,
+                "unexpected local edit during restore: file inventory changed"
+            );
         }
         Ok(tree)
     }
@@ -778,13 +802,32 @@ impl Files {
                 "staging name collision"
             );
         }
+        // The journal owns its original staging files even if a later recipe excludes
+        // one of its destinations. Only the still-managed paths may be touched on replay.
+        let journal = plan;
+        let filtered;
+        let plan = if replay && recipe.slots.values().any(|s| !s.ignores.is_empty()) {
+            filtered = Restore {
+                rollback: plan.rollback,
+                op: plan.op.clone(),
+                before: plan.before.project(recipe),
+                after: plan.after.project(recipe),
+            };
+            &filtered
+        } else {
+            plan
+        };
         let current = if replay {
             self.recover_inventory(recipe, cache, plan, &stage)?
         } else {
             self.read_tree(recipe, cache, None, true, Some(&plan.before))?
         };
         self.stage_files(cache, &stage, &current, &plan.after)?;
-        self.install_staged(recipe, cache, plan, &stage, &current, replay)
+        self.install_staged(recipe, cache, plan, &stage, &current, replay)?;
+        self.clear_staging(&stage, journal)?;
+        self.read_tree(recipe, cache, None, !replay, Some(&plan.after))
+            .context("restore verification failed")?;
+        Ok(())
     }
 
     fn recover_inventory(
@@ -906,7 +949,12 @@ impl Files {
                     continue;
                 }
                 match entry {
-                    Entry::Directory => root.dir.remove_dir(&rel)?,
+                    Entry::Directory => match root.dir.remove_dir(&rel) {
+                        Ok(()) => (),
+                        Err(e) if e.kind() == ErrorKind::DirectoryNotEmpty && target.is_none()
+                            && recipe.slots[logical_path(k).0].contains_ignore(logical_path(k).1) => (),
+                        Err(e) => return Err(e).with_context(|| format!("Cannot replace folder {k}. Move any excluded contents aside and retry.")),
+                    },
                     Entry::File { .. } => root.dir.remove_file(&rel)?,
                 }
                 sync_dir(&root.anchor.join(rel.parent().unwrap_or(Path::new("."))))?;
@@ -920,7 +968,18 @@ impl Files {
             match entry {
                 Entry::Directory => {
                     if rel != Path::new(".") {
-                        root.dir.create_dir(&rel)?;
+                        match root.dir.create_dir(&rel) {
+                            Err(e)
+                                if e.kind() == ErrorKind::AlreadyExists
+                                    && recipe.slots[logical_path(k).0]
+                                        .contains_ignore(logical_path(k).1) =>
+                            {
+                                let meta = root.dir.symlink_metadata(&rel)?;
+                                check_link(&meta, k)?;
+                                ensure!(meta.is_dir(), "expected folder at {k}");
+                            }
+                            other => other?,
+                        }
                     }
                 }
                 Entry::File { .. } => {
@@ -930,6 +989,10 @@ impl Files {
             }
             sync_dir(&root.anchor.join(rel.parent().unwrap_or(Path::new("."))))?;
         }
+        Ok(())
+    }
+
+    fn clear_staging(&self, stage: &str, plan: &Restore) -> Result<()> {
         for root in self.roots.values() {
             // Only journal-owned stage files are removed. Unexpected contents stop recovery.
             if root.dir.symlink_metadata(stage).is_ok() {
@@ -954,8 +1017,6 @@ impl Files {
                 sync_dir(&root.anchor)?;
             }
         }
-        self.read_tree(recipe, cache, None, !replay, Some(&plan.after))
-            .context("restore verification failed")?;
         Ok(())
     }
 }
@@ -1241,12 +1302,26 @@ mod preview_tests {
         let home = tmp.path().join("profile");
         fs::create_dir(&path)?;
         fs::write(path.join("old.world"), b"first")?;
-        let before = preview(&home, &path, Kind::Folder, "saves", || false)?;
+        let before = preview(
+            &home,
+            &path,
+            Kind::Folder,
+            "saves",
+            Default::default(),
+            || false,
+        )?;
         fs::rename(&path, tmp.path().join("removed-drive"))?;
         fs::create_dir(&path)?;
         fs::write(path.join("other.world"), b"second")?;
         assert!(before.binding.resolve(&path, &Kind::Folder).is_err());
-        let after = preview(&home, &path, Kind::Folder, "saves", || false)?;
+        let after = preview(
+            &home,
+            &path,
+            Kind::Folder,
+            "saves",
+            Default::default(),
+            || false,
+        )?;
         assert_eq!(after.files, ["other.world"]);
         after.binding.resolve(&path, &Kind::Folder)?;
         Ok(())
@@ -1259,7 +1334,7 @@ mod preview_tests {
         fs::write(dir.join("world"), b"data")?;
         fs::write(dir.join("player/character"), b"avatar")?;
         let home = tmp.path().join("client");
-        let read = |p: &Path, kind| preview(&home, p, kind, "saves", || false);
+        let read = |p: &Path, kind| preview(&home, p, kind, "saves", Default::default(), || false);
         let result = read(&dir, Kind::Folder)?;
         assert_eq!(result.files, ["player/character", "world"]);
         assert_eq!(result.bytes, 10);
@@ -1275,7 +1350,17 @@ mod preview_tests {
                 assert!(read(&dir, Kind::Folder).is_err());
             }
         }
-        assert!(preview(&home, &dir, Kind::Folder, "saves", || true).is_err());
+        assert!(
+            preview(
+                &home,
+                &dir,
+                Kind::Folder,
+                "saves",
+                Default::default(),
+                || true
+            )
+            .is_err()
+        );
         Ok(())
     }
 }
@@ -1335,6 +1420,24 @@ mod restore_tests {
                 after,
             },
         })
+    }
+
+    #[test]
+    fn replay_leaves_a_newly_ignored_destination_and_removes_its_staging_file() -> Result<()> {
+        let mut s = setup()?;
+        let stage = ".buddy-stage-try";
+        s.files
+            .stage_files(&s.cache, stage, &s.plan.before, &s.plan.after)?;
+        s.recipe
+            .slots
+            .get_mut("saves")
+            .unwrap()
+            .set_ignores(BTreeSet::from(["world".into()]))?;
+        fs::write(s.saves.join("world"), b"independent local data")?;
+        s.files.apply(&s.recipe, &s.cache, &s.plan)?;
+        assert_eq!(fs::read(s.saves.join("world"))?, b"independent local data");
+        assert!(!s.saves.join(stage).exists());
+        Ok(())
     }
 
     #[test]

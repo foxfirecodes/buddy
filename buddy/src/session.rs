@@ -1,6 +1,6 @@
 use crate::{
     files::{Cache, Files, Restore, SaveLocation},
-    local::{Api, Local, Pending, Setup, unreachable},
+    local::{Api, Local, OfflinePrep, Pending, Setup, unreachable},
     model::*,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -111,7 +111,16 @@ impl Online<'_> {
         let full = self
             .head
             .as_ref()
-            .map(|r| r.tree.overlay(&self.scope, tree))
+            .map(|r| {
+                // Changing an ignore alone does not generate a backup on the next exit.
+                if self.scope.slots.values().any(|s| !s.ignores.is_empty())
+                    && r.tree.project(&self.scope) == *tree
+                {
+                    r.tree.clone()
+                } else {
+                    r.tree.overlay(&self.scope, tree)
+                }
+            })
             .unwrap_or_else(|| tree.clone());
         let op = Action::Commit {
             lease: self.lease.clone(),
@@ -398,9 +407,9 @@ fn recover_local(
 ) -> Result<()> {
     if let Some(plan) = s.restore.clone() {
         let files = Files::open(scope, &s.bindings, &local.home)?;
-        files.apply(&s.recipe, cache, &plan)?;
+        files.apply(scope, cache, &plan)?;
         if !plan.rollback {
-            s.base = Some(plan.after);
+            s.base = Some(plan.after.project(scope));
         }
         s.restore = None;
         local.save(c, s)?;
@@ -418,7 +427,7 @@ fn recover_local(
     }
     Ok(())
 }
-fn acquire(api: &Api, s: &Setup, ui: Interface) -> Result<Acquisition> {
+fn acquire(api: &Api, s: &Setup, ui: Interface, preparing: bool) -> Result<Acquisition> {
     let session = s.session.clone().context("missing session id")?;
     let mut takeover = None;
     loop {
@@ -430,6 +439,11 @@ fn acquire(api: &Api, s: &Setup, ui: Interface) -> Result<Acquisition> {
         match a {
             Acquisition::Granted { .. } => return Ok(a),
             Acquisition::Busy(held) => {
+                ensure!(
+                    !preparing,
+                    "Still open on {}. Close the game there and prepare again.",
+                    held.device
+                );
                 let description = format!(
                     "{} opened this game at {}. Last lease expiry {}.",
                     held.device,
@@ -475,6 +489,7 @@ pub fn rollback(local: &Local, g: &str) -> Result<()> {
     local.save(&c, &s)
 }
 pub struct RunOptions {
+    pub prepare_offline: bool,
     pub command: Vec<OsString>,
     pub manual: bool,
     pub restore: Option<i64>,
@@ -542,7 +557,7 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
     }
     let mut progress: Option<crate::ui::Progress> = None;
     let acquired = loop {
-        match acquire(&api, &s, ui) {
+        match acquire(&api, &s, ui, options.prepare_offline) {
             Ok(grant) => break grant,
             Err(e) if !options.command.is_empty() && unreachable(&e) => {
                 ensure!(
@@ -553,50 +568,55 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
                     "Cannot reach {}. Use the last approved setup and keep this session on {} until it reconnects?",
                     c.url, c.device
                 );
-                match ui.choose(
-                    "Server unreachable",
-                    &msg,
-                    &["Retry", "Play offline", "Cancel"],
-                )? {
-                    0 => continue,
-                    1 => {
-                        recover_local(local, &c, &mut s, &scope, &cache, ui)?;
-                        let files = Files::open(&scope, &s.bindings, &local.home)?;
-                        let before = files.capture(&s.recipe, &cache, None)?;
-                        drop(files);
-                        if !before.populated() && s.base.as_ref().is_none_or(Tree::populated) {
-                            ensure!(
-                                ui.choose(
-                                    "Start with empty saves?",
-                                    "This device has no saved progress in the selected paths.",
-                                    &["Cancel", "Start a new game"]
-                                )? == 1,
-                                crate::ui::Cancelled
-                            );
-                        }
-                        s.active = true;
-                        s.active_base = s.base.clone();
-                        local.save(&c, &s)?;
-                        drop(progress.take());
-                        let mut started = false;
-                        let code = match execute(&options.command, options.manual, ui, &mut started)
-                        {
-                            Ok(code) => code,
-                            Err(error) => {
-                                if !started {
-                                    s.active = false;
-                                    s.active_base = None;
-                                    local.save(&c, &s)?;
-                                }
-                                return Err(error);
-                            }
-                        };
-                        capture_after_game(local, &c, &mut s, &scope, &cache, ui)
-                            .context(PostGame(code))?;
-                        return Ok(code);
+                if s.offline_prep.is_none() {
+                    match ui.choose(
+                        "Server unreachable",
+                        &msg,
+                        &["Retry", "Play offline", "Cancel"],
+                    )? {
+                        0 => continue,
+                        1 => (),
+                        _ => bail!(crate::ui::Cancelled),
                     }
-                    _ => bail!(crate::ui::Cancelled),
                 }
+                recover_local(local, &c, &mut s, &scope, &cache, ui)?;
+                let files = Files::open(&scope, &s.bindings, &local.home)?;
+                let before = files.capture(&s.recipe, &cache, None)?;
+                drop(files);
+                if !before.populated() && s.base.as_ref().is_none_or(Tree::populated) {
+                    ensure!(
+                        ui.choose(
+                            "Start with empty saves?",
+                            "This device has no saved progress in the selected paths.",
+                            &["Cancel", "Start a new game"]
+                        )? == 1,
+                        crate::ui::Cancelled
+                    );
+                }
+                let prepared = s.offline_prep.take();
+                if prepared.is_some() {
+                    s.offline_prep = Some(OfflinePrep::Played);
+                }
+                s.active = true;
+                s.active_base = s.base.clone();
+                local.save(&c, &s)?;
+                drop(progress.take());
+                let mut started = false;
+                let code = match execute(&options.command, options.manual, ui, &mut started) {
+                    Ok(code) => code,
+                    Err(error) => {
+                        if !started {
+                            s.offline_prep = prepared;
+                            s.active = false;
+                            s.active_base = None;
+                            local.save(&c, &s)?;
+                        }
+                        return Err(error);
+                    }
+                };
+                capture_after_game(local, &c, &mut s, &scope, &cache, ui)
+                    .context(PostGame(code))?;
+                return Ok(code);
             }
             Err(e) => return Err(e),
         }
@@ -634,6 +654,23 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
             "a location in the interrupted restore was removed from the recipe; use buddy rollback {} to recover the previous files before syncing",
             g
         );
+        if s.restore.is_some() {
+            // Persist newly excluded paths before replay so even an offline retry
+            // respects them. Widen the managed scope only after replay succeeds.
+            let mut narrowed = false;
+            for (name, slot) in &mut scope.slots {
+                let mut rules = slot.ignores.clone();
+                rules.extend(recipe.slots[name].ignores.iter().cloned());
+                if rules != slot.ignores {
+                    slot.set_ignores(rules)?;
+                    s.recipe.slots.insert(name.clone(), slot.clone());
+                    narrowed = true;
+                }
+            }
+            if narrowed {
+                local.save(&c, &s)?;
+            }
+        }
         recover_local(local, &c, &mut s, &scope, &cache, ui)?;
         if !removed.slots.is_empty() {
             for p in &s.pending {
@@ -670,6 +707,12 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
                     retired_slots,
                 },
             );
+            scope = s.recipe.clone();
+            scope.slots.retain(|k, _| s.bindings.contains_key(k));
+            for p in &mut s.pending {
+                p.tree = p.tree.project(&scope);
+                p.base = p.base.as_ref().map(|b| b.project(&scope));
+            }
             if scope.slots.is_empty() {
                 s.pending.clear();
             }
@@ -677,7 +720,10 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
         }
         if scope.slots.is_empty() {
             ensure!(
-                options.command.is_empty() && options.restore.is_none() && !options.pin,
+                options.command.is_empty()
+                    && options.restore.is_none()
+                    && !options.pin
+                    && !options.prepare_offline,
                 "all selected locations were removed from the recipe; choose a location before continuing"
             );
             api.rpc::<()>(Action::Release {
@@ -791,6 +837,16 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
             api.rpc::<()>(Action::Release {
                 lease: lease.clone(),
             })?;
+            if options.prepare_offline || matches!(s.offline_prep, Some(OfflinePrep::Ready { .. }))
+            {
+                let revision = online
+                    .head
+                    .as_ref()
+                    .context("No synced backup to prepare")?;
+                s.offline_prep = Some(OfflinePrep::ready(revision));
+            } else if matches!(s.offline_prep, Some(OfflinePrep::Played)) {
+                s.offline_prep = None;
+            }
             return Ok(0);
         }
         api.rpc::<()>(Action::Renew {
@@ -798,6 +854,9 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
         })?;
         drop(files);
         drop(progress.take());
+        if matches!(s.offline_prep, Some(OfflinePrep::Played)) {
+            s.offline_prep = None;
+        }
         s.active = true;
         s.active_base = Some(next);
         local.save(&c, &s)?;
@@ -816,6 +875,9 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
         completed_code = Some(code);
         capture_after_game(local, &c, &mut s, &scope, &cache, ui)?;
         online.publish_after_game(&s)?;
+        if matches!(s.offline_prep, Some(OfflinePrep::Ready { .. })) {
+            s.offline_prep = online.head.as_ref().map(OfflinePrep::ready);
+        }
         s.pending.clear();
         Ok(code)
     })();
@@ -849,6 +911,40 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
     } else {
         finalized
     }
+}
+
+pub fn prepare_games(
+    local: &Local,
+    games: &[String],
+    scope: &str,
+    mut report: impl FnMut(&str, Result<String>),
+) -> Result<()> {
+    let c = local.credentials()?;
+    ensure!(
+        local.scope(&c) == scope,
+        "Account changed. Reopen offline preparation."
+    );
+    local.write(&format!("offline-picks/{scope}"), &games)?;
+    for game in games {
+        let result = (|| {
+            synchronize(
+                local,
+                game,
+                RunOptions {
+                    prepare_offline: true,
+                    expected_scope: Some(scope.to_owned()),
+                    ..crate::options()
+                },
+                Interface::Unattended,
+            )?;
+            match local.setup(&c, game)?.offline_prep {
+                Some(ready @ OfflinePrep::Ready { .. }) => Ok(ready.to_string()),
+                _ => bail!("Setup changed. Prepare this game again."),
+            }
+        })();
+        report(game, result);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -30,6 +30,7 @@ struct Location {
     checked: bool,
     inventory: Inventory,
     create_missing: bool,
+    ignores: Option<BTreeSet<String>>,
 }
 impl Location {
     fn at(
@@ -48,6 +49,7 @@ impl Location {
             checked: false,
             inventory: Inventory::Waiting,
             create_missing: false,
+            ignores: None,
         }
     }
     fn set_path(&mut self, path: PathBuf) {
@@ -309,6 +311,15 @@ impl Review {
             } else {
                 None
             };
+            let ignores = row
+                .ignores
+                .clone()
+                .or_else(|| {
+                    active_recipe(d, self.shared.as_deref())
+                        .and_then(|r| r.slots.get(&row.name))
+                        .map(|s| s.ignores.clone())
+                })
+                .unwrap_or_default();
             let create_missing = row.create_missing;
             let (home, path, kind, name) = (
                 home.to_owned(),
@@ -321,7 +332,8 @@ impl Review {
             let ctx = ui.ctx().clone();
             thread::spawn(move || {
                 let cancelled = || cancel.try_recv() == Err(mpsc::TryRecvError::Disconnected);
-                let v = crate::files::preview(&home, &path, kind.clone(), &name, cancelled);
+                let v =
+                    crate::files::preview(&home, &path, kind.clone(), &name, ignores, cancelled);
                 let missing = if v.is_err() {
                     base.as_ref().and_then(|base| {
                         crate::files::preview_missing(&home, &path, kind, &name, base, cancelled)
@@ -495,6 +507,8 @@ impl Review {
         {
             row.inventory = Inventory::Waiting;
         }
+        let rules = row.ignores.as_ref().or_else(|| slot.map(|s| &s.ignores));
+        let mut edit = None;
         match &row.inventory {
             Inventory::Ready(Ok(p), _) => {
                 ui.label(format!(
@@ -503,17 +517,42 @@ impl Review {
                     bytes(p.bytes)
                 ));
                 if !p.files.is_empty() {
-                    let h = ui.text_style_height(&egui::TextStyle::Monospace);
+                    let h = ui.spacing().interact_size.y;
                     egui::ScrollArea::vertical()
                         .id_salt(("review-files", i))
                         .max_height(140.)
                         .show_rows(ui, h, p.files.len(), |ui, r| {
                             for f in &p.files[r] {
-                                ui.add(
-                                    egui::Label::new(RichText::new(f).monospace().size(13.))
-                                        .truncate(),
-                                )
-                                .on_hover_text(f);
+                                ui.horizontal(|ui| {
+                                    ui.menu_button("Ignore…", |ui| {
+                                        if ui.button("Ignore file on all devices").clicked() {
+                                            edit = Some((
+                                                if row.kind == Kind::File {
+                                                    String::new()
+                                                } else {
+                                                    f.clone()
+                                                },
+                                                true,
+                                            ));
+                                            ui.close();
+                                        }
+                                        for (end, _) in f.match_indices('/').rev() {
+                                            let folder = &f[..end];
+                                            if ui
+                                                .button(format!("Ignore folder {folder}/"))
+                                                .clicked()
+                                            {
+                                                edit = Some((folder.to_owned(), true));
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                                    ui.add(
+                                        egui::Label::new(RichText::new(f).monospace().size(13.))
+                                            .truncate(),
+                                    )
+                                    .on_hover_text(f);
+                                });
                             }
                         });
                 }
@@ -531,6 +570,28 @@ impl Review {
                 ui.weak("Counting files…");
             }
             _ => {}
+        }
+        if let Some(rules) = rules.filter(|r| !r.is_empty()) {
+            ui.collapsing(format!("Ignored on all devices ({})", rules.len()), |ui| {
+                for rule in rules {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.monospace(if rule.is_empty() { &row.name } else { rule });
+                        if ui.small_button("Include again").clicked() {
+                            edit = Some((rule.clone(), false));
+                        }
+                    });
+                }
+            });
+        }
+        if let Some((path, adding)) = edit {
+            let mut rules = rules.cloned().unwrap_or_default();
+            if adding {
+                rules.insert(path);
+            } else {
+                rules.remove(&path);
+            }
+            row.ignores = Some(rules);
+            row.inventory = Inventory::Waiting;
         }
         if let Some(source) = &row.source {
             ui.label(RichText::new(source).size(12.).color(phase::MUTED))
@@ -638,10 +699,27 @@ impl Review {
         if d.device.needs_locations() && approved.is_empty() {
             return Err("Select a save location".into());
         }
-        if approved.is_empty() && removed.is_empty() && self.root_changes.is_empty() {
+        let ignores: BTreeMap<_, _> = self
+            .rows
+            .iter()
+            .filter(|r| r.checked)
+            .filter_map(|r| {
+                let rules = r.ignores.as_ref()?;
+                let saved = active_recipe(d, self.shared.as_deref())
+                    .and_then(|recipe| recipe.slots.get(&r.name));
+                (saved.map_or(!rules.is_empty(), |s| s.ignores != *rules))
+                    .then(|| (r.name.clone(), rules.clone()))
+            })
+            .collect();
+        if approved.is_empty()
+            && removed.is_empty()
+            && self.root_changes.is_empty()
+            && ignores.is_empty()
+        {
             return Err("No changes to save".into());
         }
         Ok(ReviewedSetup {
+            ignores,
             title: title.to_owned(),
             approved,
             removed,

@@ -46,6 +46,18 @@ Each location has an ID such as `saves` or `settings` that maps to a path on eac
 
 The game’s **Settings** tab contains recipe sharing and backup retention. Publishing a recipe lets others on that server discover its path rules. Save bytes, histories and lease ownership belong to the account. **Back up now** creates a non-expiring backup of the closed game's current files. **Keep** pins an existing revision. Restore and delete are available in **Backups**. The default rolling history keeps three previous distinct commits in addition to the current one. Conflict backups and manual pins survive that rotation.
 
+### See what changed and ignore a path
+
+Open **Backups → What changed?** on any revision to see added, modified and removed paths. New backups keep this list even after their predecessor expires. For backups made before the upgrade, Buddy labels the earlier retained backup it used for comparison. If none survives, it shows the backup’s contents.
+
+Choose **Ignore…** beside a path to exclude that file or a containing folder across your account’s devices. **Edit files → Included files** also lets you preview exclusions before saving the recipe. Expand **Ignored on all devices** and choose **Include again** to undo a rule. When included again, differing copies go through normal reconciliation. Rules use exact paths, match case-insensitively, and include a folder’s descendants. Other devices learn the rules when they next connect. Local files and existing backups stay intact, including when you restore an older revision. Upgrade the server and clients before adding the first ignore to a recipe.
+
+### Prepare for offline play
+
+On the device you’re taking with you, open **Game library → Prepare for offline play…**, select your games, and choose **Prepare selected**. Buddy remembers the selection on this device. Each ready game shows where the synced save came from and when Buddy checked. A game held by another device stays there. Other selected games can still finish.
+
+Prepared games launch through Buddy during an outage without asking whether to play offline. You can play multiple times during the trip. When Buddy next reconciles the offline session successfully, it returns to asking about unexpected outages. Divergent saves still get permanent backups and a choice. Preparation covers Buddy’s save data. Games and their launchers can have their own offline requirements.
+
 ## Terminal equivalents
 
 Recipe edits to an enrolled game can be queued offline. Buddy continues offline play with its last approved setup. On reconnect it merges independent recipe fields and asks about competing edits. If a game session or restore is pending, finish that sync first. Use **Apply edits…** or `buddy apply-setup GAME --interactive` to review a queued draft. **Discard edits…** drops it.
@@ -63,6 +75,10 @@ buddy sync minecraft --interactive
 buddy run --game minecraft -- "/path/to/launcher" "one argument with spaces"
 buddy status minecraft
 buddy backups minecraft
+buddy changes minecraft 42
+buddy ignore minecraft saves/WorldOne/session.lock
+buddy unignore minecraft saves/WorldOne/session.lock
+buddy prepare-offline minecraft steam-105600
 buddy backup minecraft
 buddy policy minecraft --retention 3 --shared false
 buddy unbind minecraft settings
@@ -82,6 +98,7 @@ The Linux integration suites use isolated profiles and temporary files. Run them
 
 ```sh
 python3 tests/sync.py target/release/buddy
+python3 tests/workflows.py target/release/buddy
 python3 tests/recovery.py target/release/buddy
 python3 tests/transport.py target/release/buddy
 python3 tests/recipes.py target/release/buddy

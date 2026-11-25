@@ -62,6 +62,7 @@ fn batch(paths: &[(&str, &Path)]) -> Result<ReviewedSetup> {
         ));
     }
     Ok(ReviewedSetup {
+        ignores: Default::default(),
         title: "Sample game".into(),
         approved,
         removed: vec![],

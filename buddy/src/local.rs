@@ -33,7 +33,32 @@ pub struct Pending {
     pub op: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
+pub enum OfflinePrep {
+    Ready { origin: String, checked_at: i64 },
+    Played,
+}
+impl OfflinePrep {
+    pub fn ready(revision: &Revision) -> Self {
+        Self::Ready {
+            origin: revision.origin.clone(),
+            checked_at: now(),
+        }
+    }
+}
+impl std::fmt::Display for OfflinePrep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready { origin, checked_at } => {
+                write!(f, "Ready · synced from {origin} at {}", when(*checked_at))
+            }
+            Self::Played => f.write_str("Played offline · waiting to sync"),
+        }
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Setup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_prep: Option<OfflinePrep>,
     #[serde(default)]
     pub needs_first_pull: bool,
     #[serde(default)]
@@ -64,6 +89,7 @@ pub struct Setup {
 impl Setup {
     pub fn new(info: GameInfo) -> Self {
         Self {
+            offline_prep: None,
             draft: None,
             needs_first_pull: false,
             bindings_cleared: false,
@@ -500,6 +526,19 @@ impl Api {
         }
         let client = http(c.paired_ca.as_deref())?;
         Ok(Self { c, client })
+    }
+    pub fn backup_changes(&self, game: &str, id: i64) -> Result<BackupChanges> {
+        self.rpc(Action::BackupChanges {
+            game: game.into(),
+            id,
+        })
+        .map_err(|e| {
+            if e.downcast_ref::<ApiError>().is_some_and(|a| a.0 == 422) {
+                anyhow::anyhow!("Update the Buddy server to view backup changes.")
+            } else {
+                e
+            }
+        })
     }
     pub fn rpc<T: DeserializeOwned>(&self, a: Action) -> Result<T> {
         let send = || -> Result<T> {

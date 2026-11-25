@@ -2,7 +2,7 @@
 
 Buddy syncs selected game saves and settings between devices. The native Rust app includes the graphical client, command-line and terminal clients, Steam wrapper, and control server. The desktop sync prototype is ready for a trial with a disposable world.
 
-To build the sync app from source, run `cargo build --locked --release -p buddy` from the repository root. Open `target/release/buddy` on Linux or `target\release\buddy.exe` on Windows to start the graphical client.
+To build the sync app from source, run `cargo build --locked --release -p buddy` from the repository root. Open `target/release/buddy` on Linux or `target\release\buddy.exe` on Windows to start the graphical client. To install `buddy` into Cargo’s bin directory, run `cargo install --locked --path buddy`.
 
 For headless hosting, run `buddy init-server` in the directory where you want to keep your server settings. Edit `listen` in `server.toml`, then run `buddy invite` and `buddy serve`. Plain HTTP on a non-loopback address prints a warning and starts normally.
 
@@ -14,25 +14,15 @@ For headless hosting, run `buddy init-server` in the directory where you want to
 - [Phase design language](docs/design-language.md) describes Buddy’s visual style and links to the interactive reference.
 - [Run the Steam Deck launch probe](#buddy-launch-probe) to measure when Game Mode lets post-game work finish. This is a separate executable and experiment.
 
-## Working from a checkout with mise
+## Development tasks
 
-Run `mise trust` once, then `mise run setup` to prepare Rust. `mise tasks` lists the available tasks.
+Run `mise trust` once in your checkout. If your Rust toolchain is missing the check tools, install them with `rustup component add rustfmt clippy`.
 
-| Task | Use it for |
+| Command | What it does |
 | --- | --- |
-| `mise run build` | Build the native release, including on Windows with the MSVC build tools installed. |
-| `mise run install` | Install the native Buddy executable into Cargo’s bin directory. Pass `--root DIR` to install into `DIR/bin`. |
-| `mise run buddy` | Open the GUI. Add `tui` for the terminal UI, or pass a CLI command such as `status steam-105600`. |
-| `mise run check` | Check formatting, run Clippy, and run the Rust tests. Use `mise run test:sync` for a disposable two-device sync test on Linux. |
-| `mise run build:linux` | Build the portable x86-64 Linux and Deck client using Zig. |
-
-For a local server, run `mise run server:init`, edit `server.toml`, then run `mise run server:serve`. Use `mise run server:invite` in a second terminal to create an account invite. Once `build:linux` finishes, publish the portable client for other devices with this command.
-
-```sh
-mise run server:publish linux-x86_64 target/x86_64-unknown-linux-gnu/release/buddy
-```
-
-The server tasks use the checkout’s `server.toml` by default. Pass `--config PATH` to `server:serve`, `server:invite`, or `server:publish` to operate on another host configuration.
+| `mise run check` | Check formatting, run Clippy with warnings as errors, and test the workspace for the current platform. |
+| `mise run test:sync` | Build Buddy and exercise two-device sync against a disposable server on Linux. Requires Python 3. |
+| `mise run build:linux` | Build the portable x86-64 Linux and Steam Deck client targeting glibc 2.28. |
 
 ## Install Buddy on another device
 

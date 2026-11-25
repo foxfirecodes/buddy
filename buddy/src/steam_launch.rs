@@ -1,6 +1,7 @@
 //! Steam expands %command% for store titles. A shortcut has separate Target and Launch Options fields.
 mod binary;
 pub mod manage;
+pub mod profiles;
 mod text;
 use anyhow::{Context, Result, ensure};
 use std::path::Path;

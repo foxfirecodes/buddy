@@ -1,11 +1,8 @@
 //! Review and apply a single reversible Steam edit. Receipts belong to a local
 //! Steam profile. Save the receipt before replacing the file so retries can undo
 //! an install even if Buddy exits between the two writes.
-use super::{LaunchFields, binary, quoted_path, text};
-use crate::{
-    local::{Local, steam_installs},
-    model::{digest, key},
-};
+use super::{LaunchFields, binary, profiles::Profile, quoted_path, text};
+use crate::{local::Local, model::key};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -13,54 +10,6 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
-
-#[derive(Clone, Debug)]
-pub struct Profile {
-    pub id: String,
-    pub label: String,
-    root: PathBuf,
-    config: PathBuf,
-}
-pub fn profiles() -> Result<Vec<Profile>> {
-    let mut profiles = Vec::new();
-    for install in steam_installs() {
-        let root = install.path().canonicalize()?;
-        let userdata = root.join("userdata");
-        if !userdata.exists() {
-            continue;
-        }
-        for entry in fs::read_dir(userdata)? {
-            let entry = entry?;
-            let Some(user) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            let config = entry.path().join("config");
-            if user == 0 || !config.is_dir() {
-                continue;
-            }
-            profiles.push(Profile {
-                id: format!(
-                    "{user}-{}",
-                    &digest(root.to_string_lossy().as_bytes())[..12]
-                ),
-                label: format!("Steam account {user} · {}", root.display()),
-                root: root.clone(),
-                config: config.canonicalize()?,
-            });
-        }
-    }
-    profiles.sort_by(|a, b| a.id.cmp(&b.id));
-    profiles.dedup_by(|a, b| a.id == b.id);
-    ensure!(
-        !profiles.is_empty(),
-        "Sign in to Steam on this device first."
-    );
-    Ok(profiles)
-}
 
 pub fn launched_by_steam() -> bool {
     ["SteamAppId", "SteamGameId", "STEAM_COMPAT_APP_ID"]

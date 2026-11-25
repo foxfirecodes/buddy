@@ -1,5 +1,12 @@
 use super::{App, Event, choose};
-use crate::{distribution, local::Local, phase, session::Interface, steam_launch::manage, update};
+use crate::{
+    distribution,
+    local::Local,
+    phase,
+    session::Interface,
+    steam_launch::{manage, profiles},
+    update,
+};
 use anyhow::{Context, Result, bail, ensure};
 use eframe::egui;
 use std::io::IsTerminal;
@@ -16,7 +23,7 @@ pub(super) enum ReleaseDialog {
 }
 
 pub(crate) fn list_profiles() -> Result<()> {
-    for p in manage::profiles()? {
+    for p in profiles::list()? {
         println!("{}\t{}", p.id, p.label);
     }
     Ok(())
@@ -30,7 +37,7 @@ pub(crate) fn steam(
     ui: Interface,
     yes: bool,
 ) -> Result<String> {
-    let profiles = manage::profiles()?;
+    let profiles = profiles::list()?;
     ensure!(
         !profiles.is_empty(),
         "open Steam and sign in to a Steam account on this device first"
@@ -43,14 +50,11 @@ pub(crate) fn steam(
     } else if let [p] = profiles.as_slice() {
         p
     } else {
-        let names: Vec<_> = profiles
-            .iter()
-            .map(|p| format!("{} ({})", p.label, p.id))
-            .collect();
+        let names = profiles.iter().map(|p| p.label.as_str());
         let index = match ui {
             Interface::Window => {
                 let mut labels = vec!["Cancel"];
-                labels.extend(names.iter().map(String::as_str));
+                labels.extend(names);
                 let index = choose("Choose Steam account", "Apply this change for", &labels)?;
                 if index == 0 {
                     return Ok("Cancelled".into());
@@ -58,7 +62,7 @@ pub(crate) fn steam(
                 index - 1
             }
             Interface::Terminal if !yes => {
-                inquire::Select::new("Steam account", names)
+                inquire::Select::new("Steam account", names.collect())
                     .raw_prompt()?
                     .index
             }

@@ -149,13 +149,36 @@ fn latest(c: &Credentials, platform: &str) -> Result<SignedRelease> {
     Ok(release)
 }
 
-#[derive(Debug)]
-pub struct UntrustedReleaseKey;
+pub(crate) fn comparison_code(public_key: &[u8]) -> String {
+    sha::digest(&sha::SHA256, public_key).as_ref()[..10]
+        .chunks_exact(2)
+        .map(hex::encode_upper)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UntrustedReleaseKey {
+    pub signer: String,
+    pub code: String,
+    pub server: String,
+    scope: String,
+}
+impl UntrustedReleaseKey {
+    pub fn confirmed_key(&self, local: &Local, credentials: &Credentials) -> Result<&str> {
+        ensure!(
+            self.scope == local.scope(credentials),
+            "account or server changed; compare the key again"
+        );
+        Ok(&self.signer)
+    }
+}
 impl std::fmt::Display for UntrustedReleaseKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "run buddy server status on the host, then supply its release signing key with --trust-key KEY"
+            "compare {} with the verification code from buddy server status on {}; for unattended use, supply the host's public key with --trust-key KEY",
+            self.code, self.server
         )
     }
 }
@@ -189,7 +212,13 @@ fn trust(
         );
     } else {
         if expected.is_none() && !c.url.starts_with("https://") {
-            return Err(UntrustedReleaseKey.into());
+            return Err(UntrustedReleaseKey {
+                code: comparison_code(&hex::decode(&manifest.signer)?),
+                signer: manifest.signer.clone(),
+                server: c.url.clone(),
+                scope: local.scope(c),
+            }
+            .into());
         }
         trust = Some(ReleaseTrust {
             key: manifest.signer.clone(),

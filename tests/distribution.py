@@ -79,12 +79,16 @@ def run(root, tls):
         report = execute(publish + [PLATFORM, BUDDY])
         assert "release 1\n" in report
         pin = report.strip().split()[-1]
+        fingerprint = hashlib.sha256(bytes.fromhex(pin)).hexdigest()[:20].upper()
+        code = " ".join(fingerprint[i:i+4] for i in range(0, len(fingerprint), 4))
         listing = execute(status)
         assert f"Release signing key: {pin}" in listing and f"{PLATFORM}: release 1" in listing
+        assert f"Verification code: {code}" in listing and f"Verification code: {code}" in report
         assert report == execute(publish + [PLATFORM, BUDDY])
         assert report == execute([BUDDY, "publish-release", "--config", cfg, PLATFORM, BUDDY])
         if not tls:
-            assert "--trust-key" in execute(link, ok=False)
+            untrusted = execute(link, ok=False)
+            assert "--trust-key" in untrusted and code in untrusted
             assert "differs" in execute(link + ["--trust-key", "0" * 64], ok=False)
         command = execute(link + ([] if tls else ["--trust-key", pin])).strip()
         # Simulate damaged metadata or files in storage. Neither may execute or consume the link.

@@ -1,7 +1,7 @@
 //! The host operator publishes local files; HTTP only serves immutable snapshots.
 use super::*;
 use crate::distribution::{
-    MAX_BINARY, Release, SignedRelease, hash_copy, platform_ok, verify_platform,
+    MAX_BINARY, Release, SignedRelease, comparison_code, hash_copy, platform_ok, verify_platform,
 };
 use axum::{body::Body, http::header};
 use ring::{
@@ -65,6 +65,11 @@ pub fn status(config: &Path) -> Result<String> {
                     );
                 } else {
                     write!(report, "\nRelease signing key: {}", manifest.signer)?;
+                    write!(
+                        report,
+                        "\nVerification code: {}",
+                        comparison_code(&hex::decode(&manifest.signer)?)
+                    )?;
                     signer = Some(manifest.signer);
                 }
                 write!(
@@ -178,7 +183,8 @@ pub fn publish_release(config: &Path, platform: &str, binary: &Path) -> Result<S
     };
     tx.commit()?;
     Ok(format!(
-        "{platform} release {generation}\nRelease signing key: {signer}"
+        "{platform} release {generation}\nVerification code: {}\nRelease signing key: {signer}",
+        comparison_code(key.public_key().as_ref())
     ))
 }
 

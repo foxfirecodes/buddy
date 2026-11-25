@@ -22,7 +22,7 @@ use model::*;
 use session::{Interface, RunOptions, synchronize};
 use std::{
     ffi::OsString,
-    io::{self, BufRead},
+    io::{self, BufRead, IsTerminal},
     path::PathBuf,
 };
 
@@ -281,6 +281,29 @@ fn cli_decisions(interactive: bool) -> Interface {
         Interface::Unattended
     }
 }
+fn with_release_trust<T>(
+    local: &Local,
+    pin: Option<&str>,
+    action: impl Fn(Option<&str>) -> Result<T>,
+) -> Result<T> {
+    let review = match action(pin) {
+        Err(error) if pin.is_none() && io::stdin().is_terminal() && io::stdout().is_terminal() => {
+            error.downcast::<distribution::UntrustedReleaseKey>()?
+        }
+        result => return result,
+    };
+    eprintln!(
+        "Compare with buddy server status on {}\nVerification code: {}\nPublic key: {}",
+        review.server, review.code, review.signer
+    );
+    anyhow::ensure!(
+        inquire::Confirm::new("Do the codes match? Trust this release key?")
+            .with_default(false)
+            .prompt()?,
+        "release key was not trusted"
+    );
+    action(Some(review.confirmed_key(local, &local.credentials()?)?))
+}
 fn main() {
     let args = Args::parse();
     let window = matches!(
@@ -356,15 +379,11 @@ fn dispatch(args: Args) -> Result<i32> {
                     platform,
                     trust_key,
                 } => {
-                    println!(
-                        "{}",
-                        distribution::install_command(
-                            &l,
-                            &l.credentials()?,
-                            &platform,
-                            trust_key.as_deref()
-                        )?
-                    );
+                    let credentials = l.credentials()?;
+                    let command = with_release_trust(&l, trust_key.as_deref(), |pin| {
+                        distribution::install_command(&l, &credentials, &platform, pin)
+                    })?;
+                    println!("{command}");
                 }
                 Cmd::RedeemDevice {
                     private_file_credential,
@@ -372,7 +391,10 @@ fn dispatch(args: Args) -> Result<i32> {
                     distribution::redeem_stdin(&l, private_file_credential)?;
                 }
                 Cmd::Update { trust_key } => {
-                    match update::run(&l, &l.credentials()?, trust_key.as_deref(), || Ok(true))? {
+                    let credentials = l.credentials()?;
+                    match with_release_trust(&l, trust_key.as_deref(), |pin| {
+                        update::run(&l, &credentials, pin, || Ok(true))
+                    })? {
                         update::Outcome::Current => println!("Buddy is up to date"),
                         update::Outcome::Updated(path) => println!("Updated {}", path.display()),
                         update::Outcome::Cancelled => {}

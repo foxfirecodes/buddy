@@ -18,7 +18,7 @@ pub(super) enum ReleaseAction {
 }
 
 pub(super) enum ReleaseDialog {
-    Trust(ReleaseAction, String),
+    Trust(ReleaseAction, distribution::UntrustedReleaseKey),
     Command(String),
 }
 
@@ -164,7 +164,11 @@ impl App {
         });
     }
 
-    fn release_action(&mut self, action: ReleaseAction, key: Option<String>) {
+    fn release_action(
+        &mut self,
+        action: ReleaseAction,
+        reviewed: Option<distribution::UntrustedReleaseKey>,
+    ) {
         let account = self.account.clone();
         let server = self.url.clone();
         self.job(move |local| {
@@ -174,12 +178,16 @@ impl App {
                     && crate::local::canonical_url(&server)? == credentials.url,
                 "account changed; reopen Buddy to continue"
             );
+            let pin = reviewed
+                .as_ref()
+                .map(|review| review.confirmed_key(&local, &credentials))
+                .transpose()?;
             let outcome = match action {
                 ReleaseAction::Pair(platform) => {
-                    distribution::install_command(&local, &credentials, platform, key.as_deref())
+                    distribution::install_command(&local, &credentials, platform, pin)
                         .map(|command| Event::ReleaseDialog(ReleaseDialog::Command(command)))
                 }
-                ReleaseAction::Update => update::run(&local, &credentials, key.as_deref(), || {
+                ReleaseAction::Update => update::run(&local, &credentials, pin, || {
                     Ok(choose(
                         "Update Buddy",
                         "Install the verified build from your server and reopen Buddy?",
@@ -195,19 +203,10 @@ impl App {
                     }
                 }),
             };
-            match outcome {
-                Err(error)
-                    if error
-                        .downcast_ref::<distribution::UntrustedReleaseKey>()
-                        .is_some() =>
-                {
-                    Ok(Event::ReleaseDialog(ReleaseDialog::Trust(
-                        action,
-                        String::new(),
-                    )))
-                }
-                value => value,
-            }
+            outcome.or_else(|error| {
+                let key = error.downcast::<distribution::UntrustedReleaseKey>()?;
+                Ok(Event::ReleaseDialog(ReleaseDialog::Trust(action, key)))
+            })
         });
     }
 
@@ -266,22 +265,19 @@ impl App {
             ui.set_max_width((ctx.screen_rect().width() - 60.).clamp(160., 520.));
             match dialog {
                 ReleaseDialog::Trust(action, key) => {
-                    ui.heading("Trust this release key");
-                    ui.label(
-                        "Run buddy server status on your server and paste the release signing key.",
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(key)
-                            .hint_text("Release key")
-                            .desired_width(f32::INFINITY),
-                    );
+                    ui.heading("Compare release key");
+                    ui.label(&key.server);
+                    ui.label("Compare this code with buddy server status on your host.");
+                    ui.label(egui::RichText::new(&key.code).monospace().size(23.0));
+                    ui.collapsing("Full public key", |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&key.signer).monospace()).wrap(),
+                        );
+                    });
                     ui.horizontal(|ui| {
                         let cancel = ui.button("Cancel").clicked();
-                        if ui
-                            .add_enabled(!key.trim().is_empty(), phase::primary("Continue"))
-                            .clicked()
-                        {
-                            retry = Some((*action, key.trim().to_owned()));
+                        if ui.add(phase::primary("Codes match · Trust")).clicked() {
+                            retry = Some((*action, key.clone()));
                         }
                         cancel || retry.is_some()
                     })

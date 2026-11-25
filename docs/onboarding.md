@@ -21,7 +21,7 @@ The CLI supports `buddy login SERVER_URL ACCOUNT --pairing PATH_TO_PAIRING_FILE`
 
 Search **Game library** by title, including games installed in additional Steam libraries. **Server recipes** shows games with a file layout from your account or a recipe another player explicitly shared. Open the game or choose **+ Non-Steam game**. An enrolled game opens its overview. Choose **Edit files** to change this device’s selection.
 
-For a new game, review **Files to sync**. Buddy uses your account’s existing layout when available. When other players have shared recipes, the **File recipe** menu lets you choose theirs or use **Detected locations**. A recipe identifies locations. Each player’s saves stay private.
+For a new game, review **Files to sync**. Buddy uses your account’s existing layout when available. When other players have shared recipes, the **File recipe** menu lets you choose theirs or use **Detected locations**. A recipe identifies locations. Map its roots above the location list, then select the locations to sync on this device. Each player’s saves stay private.
 
 Check the locations you want. Select a row to inspect its relative filenames in **Included files**. For vanilla Terraria or Starbound, select both player and world directories to sync characters and worlds together. Game settings are optional. A modded launcher may use different locations. Use **Add files…** to browse from Home, the Steam folder or an available Proton prefix. **Custom root directories** lets devices map the same root name to different folders.
 

@@ -58,7 +58,7 @@ fn batch(paths: &[(&str, &Path)]) -> Result<ReviewedSetup> {
                 settings: false,
                 source: None,
             },
-            preview,
+            crate::files::ReviewedBinding::Existing(preview),
         ));
     }
     Ok(ReviewedSetup {
@@ -138,6 +138,7 @@ fn reviewed_setup_has_one_commit_and_preserves_other_devices_slots() -> Result<(
         },
         shared: false,
         revision: 0,
+        retired_slots: Default::default(),
     };
     let mut provisional = Setup::new(initial.clone());
     provisional.draft = Some(Draft::new(initial));

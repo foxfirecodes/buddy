@@ -234,6 +234,10 @@ pub fn first_launch(
     let remote = api.rpc::<Vec<GameInfo>>(Action::Games)?.into_iter().find(|g| g.recipe.game==game)
         .context("Proton is ready. Choose the save paths for this game in Buddy before pressing Play again.")?;
     remote.recipe.validate()?;
+    ensure!(
+        !remote.recipe.slots.is_empty(),
+        "choose a save location for this game in Buddy before playing"
+    );
     let mut setup = Setup::new(remote);
     let mut selected = BTreeMap::new();
     for (id, slot) in &setup.recipe.slots {

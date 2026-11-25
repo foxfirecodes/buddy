@@ -51,6 +51,23 @@ impl Binding {
         );
         Ok(actual)
     }
+    fn matches_dir(&self, dir: &Dir) -> Result<bool> {
+        #[cfg(unix)]
+        {
+            use cap_std::fs::MetadataExt;
+            let m = dir.dir_metadata()?;
+            Ok(m.dev() == self.dev && m.ino() == self.ino)
+        }
+        #[cfg(windows)]
+        {
+            Ok(Some(identity(dir)?) == self.identity)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = dir;
+            Ok(true)
+        }
+    }
     pub fn new(path: &Path, kind: &Kind) -> Result<Self> {
         let path = std::path::absolute(path)?;
         let root = anchor(&path, kind)?
@@ -279,8 +296,200 @@ impl Root {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum ReviewedBinding {
+    Existing(Binding),
+    Missing {
+        base: Binding,
+        relative: PathBuf,
+        ancestors: Vec<Binding>,
+    },
+}
+
+impl ReviewedBinding {
+    pub fn validate(&self, path: &Path, kind: &Kind) -> Result<()> {
+        match self {
+            Self::Existing(binding) => {
+                Binding::for_selection(path, kind, Some(binding))?;
+            }
+            Self::Missing {
+                base,
+                relative,
+                ancestors,
+            } => {
+                Binding::for_selection(&base.path, &Kind::Folder, Some(base))?;
+                ensure!(
+                    base.path.join(relative) == path,
+                    "destination changed since preview"
+                );
+                let folder = if *kind == Kind::File {
+                    relative.parent().context("missing parent")?
+                } else {
+                    relative.as_path()
+                };
+                let mut current = base.path.clone();
+                for (index, part) in folder.components().enumerate() {
+                    ensure!(
+                        matches!(part, std::path::Component::Normal(_)),
+                        "invalid destination"
+                    );
+                    current.push(part);
+                    if let Some(prior) = ancestors.get(index) {
+                        Binding::for_selection(&current, &Kind::Folder, Some(prior))?;
+                    } else {
+                        match fs::symlink_metadata(&current) {
+                            Err(e) if e.kind() == ErrorKind::NotFound => (),
+                            Ok(_) => bail!("destination changed since preview"),
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub fn resolve(&self, path: &Path, kind: &Kind) -> Result<Binding> {
+        self.resolve_with_created(path, kind, &mut BTreeMap::new())
+    }
+    pub fn resolve_with_created(
+        &self,
+        path: &Path,
+        kind: &Kind,
+        created: &mut BTreeMap<PathBuf, Binding>,
+    ) -> Result<Binding> {
+        match self {
+            Self::Existing(binding) => Binding::for_selection(path, kind, Some(binding)),
+            Self::Missing {
+                base,
+                relative,
+                ancestors,
+            } => {
+                Binding::for_selection(&base.path, &Kind::Folder, Some(base))?;
+                ensure!(
+                    base.path.join(relative) == path,
+                    "destination changed since preview"
+                );
+                let folder = if *kind == Kind::File {
+                    relative.parent().context("missing parent")?
+                } else {
+                    relative.as_path()
+                };
+                let mut dir = Dir::open_ambient_dir(&base.path, ambient_authority())?;
+                ensure!(base.matches_dir(&dir)?, "mapped root changed since preview");
+                let mut current = base.path.clone();
+                for (index, part) in folder.components().enumerate() {
+                    let std::path::Component::Normal(part) = part else {
+                        bail!("invalid destination")
+                    };
+                    current.push(part);
+                    if let Some(reviewed) = ancestors.get(index) {
+                        Binding::for_selection(&current, &Kind::Folder, Some(reviewed))?;
+                    } else if let Some(reviewed) = created.get(&current) {
+                        Binding::for_selection(&current, &Kind::Folder, Some(reviewed))?;
+                    } else {
+                        if let Err(error) = dir.create_dir(part) {
+                            if error.kind() == ErrorKind::AlreadyExists {
+                                return Err(error).context("destination changed since preview");
+                            }
+                            return Err(error).with_context(|| {
+                                format!("create destination directory {}", current.display())
+                            });
+                        }
+                        created.insert(current.clone(), Binding::new(&current, &Kind::Folder)?);
+                    }
+                    let opened = cap_primitives::fs::open_dir_nofollow(
+                        &dir.into_std_file(),
+                        Path::new(part),
+                    )?;
+                    dir = Dir::from_std_file(opened);
+                    let expected = ancestors
+                        .get(index)
+                        .or_else(|| created.get(&current))
+                        .context("missing directory identity")?;
+                    ensure!(
+                        expected.matches_dir(&dir)?,
+                        "destination changed since preview"
+                    );
+                }
+                let binding = Binding::new(path, kind)?;
+                ensure!(
+                    binding.path == path && binding.matches_dir(&dir)?,
+                    "destination changed since preview"
+                );
+                Ok(binding)
+            }
+        }
+    }
+}
+
+pub fn preview_missing(
+    home: &Path,
+    path: &Path,
+    kind: Kind,
+    _slot: &str,
+    base: &Path,
+    cancelled: impl Fn() -> bool,
+) -> Result<Preview> {
+    ensure!(!cancelled(), "preview cancelled");
+    let original_base = std::path::absolute(base)?;
+    let path = std::path::absolute(path)?;
+    let relative = path
+        .strip_prefix(&original_base)
+        .context("destination outside mapped root")?
+        .to_owned();
+    let base = Binding::new(base, &Kind::Folder)?;
+    let path = base.path.join(&relative);
+    ensure!(
+        !relative.as_os_str().is_empty()
+            && relative
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_))),
+        "choose a game-specific location"
+    );
+    ensure!(
+        !home.starts_with(&path) && !path.starts_with(home),
+        "save selection overlaps Buddy's own data"
+    );
+    let mut current = base.path.clone();
+    let mut ancestors = vec![];
+    let folder = if kind == Kind::File {
+        relative.parent().context("missing parent")?
+    } else {
+        relative.as_path()
+    };
+    for part in folder.components() {
+        ensure!(!cancelled(), "preview cancelled");
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(m) => {
+                ensure!(
+                    m.is_dir() && !m.file_type().is_symlink(),
+                    "destination contains a link or non-directory"
+                );
+                ancestors.push(Binding::new(&current, &Kind::Folder)?);
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    ensure!(
+        !anchor(&path, &kind)?.exists(),
+        "destination already exists; review again"
+    );
+    Ok(Preview {
+        binding: ReviewedBinding::Missing {
+            base,
+            relative,
+            ancestors,
+        },
+        files: vec![],
+        bytes: 0,
+    })
+}
+
 pub struct Preview {
-    pub binding: Binding,
+    pub binding: ReviewedBinding,
     pub files: Vec<String>,
     pub bytes: u64,
 }
@@ -319,7 +528,7 @@ pub fn preview(
         home,
     )?;
     let mut result = Preview {
-        binding,
+        binding: ReviewedBinding::Existing(binding),
         files: vec![],
         bytes: 0,
     };
@@ -914,6 +1123,107 @@ mod rollback_tests {
 mod preview_tests {
     use super::*;
     #[test]
+    fn missing_recipe_destination_is_created_only_on_approval() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let base = tmp.path().join("games");
+        fs::create_dir(&base)?;
+        let home = tmp.path().join("buddy");
+        let path = base.join("game/saves");
+        let reviewed = preview_missing(&home, &path, Kind::Folder, "saves", &base, || false)?;
+        assert!(!path.exists());
+        reviewed.binding.resolve(&path, &Kind::Folder)?;
+        assert!(path.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_sibling_destinations_share_created_ancestor() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let base = tmp.path().join("games");
+        fs::create_dir(&base)?;
+        let home = tmp.path().join("buddy");
+        let a = base.join("game/players");
+        let b = base.join("game/worlds");
+        let first = preview_missing(&home, &a, Kind::Folder, "players", &base, || false)?;
+        let second = preview_missing(&home, &b, Kind::Folder, "worlds", &base, || false)?;
+        first.binding.validate(&a, &Kind::Folder)?;
+        second.binding.validate(&b, &Kind::Folder)?;
+        let mut created = BTreeMap::new();
+        first
+            .binding
+            .resolve_with_created(&a, &Kind::Folder, &mut created)?;
+        second
+            .binding
+            .resolve_with_created(&b, &Kind::Folder, &mut created)?;
+        assert!(a.is_dir() && b.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_file_creates_parent_but_not_file() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let base = tmp.path().join("games");
+        fs::create_dir(&base)?;
+        let path = base.join("game/save.dat");
+        let reviewed = preview_missing(
+            &tmp.path().join("buddy"),
+            &path,
+            Kind::File,
+            "save",
+            &base,
+            || false,
+        )?;
+        reviewed.binding.resolve(&path, &Kind::File)?;
+        assert!(path.parent().unwrap().is_dir());
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_destination_rejects_symlink_after_preview() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let base = tmp.path().join("games");
+        fs::create_dir(&base)?;
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside)?;
+        let path = base.join("game/saves");
+        let reviewed = preview_missing(
+            &tmp.path().join("buddy"),
+            &path,
+            Kind::Folder,
+            "save",
+            &base,
+            || false,
+        )?;
+        std::os::unix::fs::symlink(&outside, base.join("game"))?;
+        assert!(reviewed.binding.resolve(&path, &Kind::Folder).is_err());
+        assert!(!outside.join("saves").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_destination_rejects_changed_ancestor() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let base = tmp.path().join("games");
+        fs::create_dir_all(base.join("game"))?;
+        let path = base.join("game/saves");
+        let reviewed = preview_missing(
+            &tmp.path().join("buddy"),
+            &path,
+            Kind::Folder,
+            "save",
+            &base,
+            || false,
+        )?;
+        fs::rename(base.join("game"), base.join("old"))?;
+        fs::create_dir(base.join("game"))?;
+        assert!(reviewed.binding.resolve(&path, &Kind::Folder).is_err());
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
     fn replaced_root_requires_a_new_preview() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let path = tmp.path().join("drive");
@@ -924,10 +1234,10 @@ mod preview_tests {
         fs::rename(&path, tmp.path().join("removed-drive"))?;
         fs::create_dir(&path)?;
         fs::write(path.join("other.world"), b"second")?;
-        assert!(Binding::for_selection(&path, &Kind::Folder, Some(&before.binding)).is_err());
+        assert!(before.binding.resolve(&path, &Kind::Folder).is_err());
         let after = preview(&home, &path, Kind::Folder, "saves", || false)?;
         assert_eq!(after.files, ["other.world"]);
-        Binding::for_selection(&path, &Kind::Folder, Some(&after.binding))?;
+        after.binding.resolve(&path, &Kind::Folder)?;
         Ok(())
     }
     #[test]

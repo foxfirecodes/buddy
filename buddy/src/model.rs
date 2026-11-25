@@ -96,7 +96,7 @@ impl Recipe {
             "invalid game identity"
         );
         ensure!(
-            (1..=100).contains(&self.slots.len()) && self.retention <= 1000,
+            self.slots.len() <= 100 && self.retention <= 1000,
             "invalid slot count or retention"
         );
         for (name, slot) in &self.slots {
@@ -297,6 +297,8 @@ pub enum Acquisition {
         recipe: Recipe,
         revision: i64,
         shared: bool,
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        retired_slots: BTreeSet<String>,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -328,6 +330,8 @@ pub struct GameInfo {
     pub recipe: Recipe,
     pub revision: i64,
     pub shared: bool,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retired_slots: BTreeSet<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -338,6 +342,11 @@ pub enum Action {
         recipe: Recipe,
         expected: i64,
         shared: bool,
+    },
+    RemoveSlot {
+        game: String,
+        slot: String,
+        expected: i64,
     },
     Acquire {
         game: String,

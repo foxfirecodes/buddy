@@ -4,9 +4,9 @@ use eframe::egui::{self, Button, Color32, Frame, Key, Modifiers, RichText, Strok
 use serde::{Deserialize, Serialize};
 use std::{
     io::{self, BufRead, Write},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -409,17 +409,50 @@ pub fn progress_window() -> Result<()> {
 }
 
 // The pipe ties the indicator to this process even when Steam terminates the wrapper.
-pub struct Progress(Option<mpsc::Sender<Activity>>);
+#[derive(Default)]
+struct ProgressChild {
+    stopped: bool,
+    child: Option<Child>,
+}
+pub struct Progress {
+    tx: Option<mpsc::Sender<Activity>>,
+    child: Arc<Mutex<ProgressChild>>,
+}
+impl Drop for Progress {
+    fn drop(&mut self) {
+        self.tx.take();
+        let mut state = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        state.stopped = true;
+        if let Some(mut child) = state.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 impl Progress {
     pub fn start(ui: Interface, game: &str, message: &str) -> Self {
-        if !matches!(ui, Interface::Window) {
-            return Self(None);
-        }
+        let command = if matches!(ui, Interface::Window) {
+            std::env::current_exe().ok().map(|binary| {
+                let mut command = Command::new(binary);
+                command.arg("_progress");
+                command
+            })
+        } else {
+            None
+        };
+        Self::start_with(command, game, message, Duration::from_secs(1))
+    }
+    fn start_with(command: Option<Command>, game: &str, message: &str, delay: Duration) -> Self {
+        let child = Arc::new(Mutex::new(ProgressChild::default()));
+        let Some(mut command) = command else {
+            return Self { tx: None, child };
+        };
         let (tx, rx) = mpsc::channel();
         let game = game.to_owned();
         let mut status = Activity::Stage(message.to_owned());
+        let worker_child = Arc::clone(&child);
         thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = Instant::now() + delay;
             loop {
                 match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(next) => status = next,
@@ -427,48 +460,103 @@ impl Progress {
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                 }
             }
-            let Ok(binary) = std::env::current_exe() else {
-                return;
+            let mut pipe = {
+                let mut state = worker_child.lock().unwrap_or_else(|e| e.into_inner());
+                if state.stopped {
+                    return;
+                }
+                let Ok(mut process) = command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                else {
+                    return;
+                };
+                let pipe = process.stdin.take();
+                state.child = Some(process);
+                pipe
             };
-            let Ok(mut child) = Command::new(binary)
-                .arg("_progress")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            else {
-                return;
-            };
-            if let Some(mut pipe) = child.stdin.take() {
+            if let Some(ref mut pipe) = pipe {
                 for update in std::iter::once(status).chain(rx) {
-                    if serde_json::to_writer(&mut pipe, &(&game, update)).is_err()
+                    if serde_json::to_writer(&mut *pipe, &(&game, update)).is_err()
                         || writeln!(pipe).is_err()
                     {
                         break;
                     }
                 }
             }
-            let _ = child.wait();
         });
-        Self(Some(tx))
+        Self {
+            tx: Some(tx),
+            child,
+        }
     }
     pub fn uploaded(&self, completed: u64, total: u64) {
         if total > 0
-            && let Some(tx) = &self.0
+            && let Some(tx) = &self.tx
         {
             let _ = tx.send(Activity::Upload { completed, total });
         }
     }
     pub fn downloaded(&self, completed: u64, total: u64) {
         if total > 0
-            && let Some(tx) = &self.0
+            && let Some(tx) = &self.tx
         {
             let _ = tx.send(Activity::Download { completed, total });
         }
     }
     pub fn status(&self, text: &str) {
-        if let Some(tx) = &self.0 {
+        if let Some(tx) = &self.tx {
             let _ = tx.send(Activity::Stage(text.into()));
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_progress_stops_helper_even_when_pipe_is_stalled() {
+        let progress = Progress::start_with(
+            Some({
+                let mut command = Command::new("sleep");
+                command.arg("30");
+                command
+            }),
+            "game",
+            "syncing",
+            Duration::ZERO,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Some(pid) = progress.child.lock().unwrap().child.as_ref().map(Child::id) {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "progress helper did not start");
+            thread::yield_now();
+        };
+        progress.status(&"x".repeat(1_000_000));
+        thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
+        drop(progress);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn dropping_fast_progress_never_starts_helper() {
+        let progress = Progress::start_with(
+            Some(Command::new("sleep")),
+            "game",
+            "syncing",
+            Duration::from_millis(150),
+        );
+        let child = Arc::clone(&progress.child);
+        drop(progress);
+        thread::sleep(Duration::from_millis(250));
+        let state = child.lock().unwrap();
+        assert!(state.stopped && state.child.is_none());
     }
 }

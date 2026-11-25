@@ -644,6 +644,7 @@ dependencies = [
  "axum-server",
  "blake3",
  "buddy-process",
+ "cap-primitives",
  "cap-std",
  "chrono",
  "clap",

@@ -240,6 +240,37 @@ fn finish_local(
     s.active_base = None;
     local.save(c, s)
 }
+fn recover_local(
+    local: &Local,
+    c: &Credentials,
+    s: &mut Setup,
+    scope: &Recipe,
+    cache: &Cache,
+    ui: Interface,
+) -> Result<()> {
+    if let Some(plan) = s.restore.clone() {
+        let files = Files::open(scope, &s.bindings, &local.home)?;
+        files.apply(&s.recipe, cache, &plan)?;
+        if !plan.rollback {
+            s.base = Some(plan.after);
+        }
+        s.restore = None;
+        local.save(c, s)?;
+    }
+    if s.active {
+        ensure!(
+            ui.choose(
+                "Recover interrupted session",
+                "Confirm the previous game is fully closed before capturing its surviving files.",
+                &["Cancel", "Game is closed"]
+            )? == 1,
+            "cancelled"
+        );
+        let files = Files::open(scope, &s.bindings, &local.home)?;
+        finish_local(false, local, c, s, &files, cache)?;
+    }
+    Ok(())
+}
 fn acquire(api: &Api, s: &Setup, ui: Interface) -> Result<Acquisition> {
     let session = s.session.clone().context("missing session id")?;
     let mut takeover = None;
@@ -348,46 +379,10 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
         !scope.slots.is_empty(),
         "choose at least one file or directory for this device"
     );
-    let files = Files::open(&scope, &s.bindings, &local.home)?;
-    if let Some(id) = options.restore
-        && matches!(ui, Interface::Window)
-    {
-        // These approved device bindings now hold the same locks used for restore.
-        let targets = scope
-            .slots
-            .keys()
-            .map(|name| s.bindings[name].path.display().to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        ensure!(
-            ui.choose(
-                "Restore backup",
-                &format!("Restore backup #{id} to the server and these locations?\n\n{targets}"),
-                &["Cancel", "Restore"]
-            )? == 1,
-            "cancelled"
-        );
-    }
     let _cache_lock = local.cache_lock(&c, false)?;
     let cache = local.cache(&c)?;
-    if let Some(plan) = s.restore.clone() {
-        files.apply(&s.recipe, &cache, &plan)?;
-        if !plan.rollback {
-            s.base = Some(plan.after);
-        }
-        s.restore = None;
-        local.save(&c, &s)?;
-    }
-    if s.active {
-        ensure!(
-            ui.choose(
-                "Recover interrupted session",
-                "Confirm the previous game is fully closed before capturing its surviving files.",
-                &["Cancel", "Game is closed"]
-            )? == 1,
-            "cancelled"
-        );
-        finish_local(false, local, &c, &mut s, &files, &cache)?;
+    if s.active && s.restore.is_none() {
+        recover_local(local, &c, &mut s, &scope, &cache, ui)?;
     }
     if s.session.is_none() {
         s.session = Some(id());
@@ -413,6 +408,8 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
                 )? {
                     0 => continue,
                     1 => {
+                        recover_local(local, &c, &mut s, &scope, &cache, ui)?;
+                        let files = Files::open(&scope, &s.bindings, &local.home)?;
                         let before = files.capture(&s.recipe, &cache, None)?;
                         if !before.populated() && s.base.as_ref().is_none_or(Tree::populated) {
                             ensure!(
@@ -462,32 +459,114 @@ pub fn synchronize(local: &Local, g: &str, options: RunOptions, ui: Interface) -
         recipe,
         revision,
         shared,
+        retired_slots,
     } = acquired
     else {
         unreachable!()
     };
     let beat = Heartbeat::new(api.clone(), lease.clone());
-    let mut online = Online {
-        api: &api,
-        lease: lease.clone(),
-        head,
-        ui,
-        cache: &cache,
-        scope: scope.clone(),
-    };
     let mut completed_code = None;
     let result = (|| -> Result<i32> {
         recipe.validate()?;
+        let mut removed = scope.clone();
+        removed.slots.retain(|k, _| !recipe.slots.contains_key(k));
+        ensure!(
+            removed.slots.keys().all(|k| retired_slots.contains(k)),
+            "server recipe changed unexpectedly; reopen setup"
+        );
         ensure!(
             scope
                 .slots
                 .iter()
-                .all(|(k, slot)| recipe.slots.get(k).is_some_and(|r| r.kind == slot.kind)),
-            "server recipe changed; review and bind its slots on this device"
+                .all(|(k, slot)| recipe.slots.get(k).is_none_or(|r| r.kind == slot.kind)),
+            "server slot changed type; reopen setup"
         );
-        s.recipe = recipe;
-        s.revision = revision;
-        s.shared = shared;
+        ensure!(
+            removed.slots.is_empty() || s.restore.is_none(),
+            "a location in the interrupted restore was removed from the recipe; use buddy rollback {} to recover the previous files before syncing",
+            g
+        );
+        recover_local(local, &c, &mut s, &scope, &cache, ui)?;
+        if !removed.slots.is_empty() {
+            for p in &s.pending {
+                let historical = p.tree.project(&removed);
+                if p.base.as_ref().map(|t| t.project(&removed)).as_ref() != Some(&historical) {
+                    api.upload(&cache, &p.tree, |_, _| {})?;
+                    api.rpc::<i64>(Action::Preserve {
+                        game: g.to_owned(),
+                        slots: scope.slots.keys().cloned().collect(),
+                        local: p.tree.clone(),
+                        time: p.time,
+                        op: p.op.clone(),
+                    })?;
+                }
+            }
+            scope.slots.retain(|k, _| recipe.slots.contains_key(k));
+            for p in &mut s.pending {
+                p.tree = p.tree.project(&scope);
+                p.base = p.base.as_ref().map(|t| t.project(&scope));
+                p.op = id();
+            }
+        }
+        if s.revision != revision
+            || s.recipe != recipe
+            || s.shared != shared
+            || s.retired_slots != retired_slots
+        {
+            crate::setup::accept_recipe(
+                &mut s,
+                GameInfo {
+                    recipe,
+                    revision,
+                    shared,
+                    retired_slots,
+                },
+            );
+            if scope.slots.is_empty() {
+                s.pending.clear();
+            }
+            local.save(&c, &s)?;
+        }
+        if scope.slots.is_empty() {
+            ensure!(
+                options.command.is_empty() && options.restore.is_none() && !options.pin,
+                "all selected locations were removed from the recipe; choose a location before continuing"
+            );
+            api.rpc::<()>(Action::Release {
+                lease: lease.clone(),
+            })?;
+            return Ok(0);
+        }
+        let files = Files::open(&scope, &s.bindings, &local.home)?;
+        if let Some(id) = options.restore
+            && matches!(ui, Interface::Window)
+        {
+            // These approved device bindings now hold the same locks used for restore.
+            let targets = scope
+                .slots
+                .keys()
+                .map(|name| s.bindings[name].path.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            ensure!(
+                ui.choose(
+                    "Restore backup",
+                    &format!(
+                        "Restore backup #{id} to the server and these locations?\n\n{targets}"
+                    ),
+                    &["Cancel", "Restore"]
+                )? == 1,
+                "cancelled"
+            );
+        }
+        let mut online = Online {
+            api: &api,
+            lease: lease.clone(),
+            head,
+            ui,
+            cache: &cache,
+            scope: scope.clone(),
+        };
         // Queue entries contain immutable bytes, so choosing a remote winner cannot erase later offline sessions.
         progress = Some(crate::ui::Progress::start(
             ui,

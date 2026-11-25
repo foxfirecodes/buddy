@@ -16,10 +16,10 @@ use std::{
 enum Inventory {
     Waiting,
     Scanning {
-        result: mpsc::Receiver<Result<Preview, String>>,
+        result: mpsc::Receiver<(Result<Preview, String>, bool)>,
         _alive: mpsc::Sender<()>,
     },
-    Ready(Result<Preview, String>),
+    Ready(Result<Preview, String>, bool),
 }
 struct Location {
     name: String,
@@ -29,6 +29,7 @@ struct Location {
     source: Option<String>,
     checked: bool,
     inventory: Inventory,
+    create_missing: bool,
 }
 impl Location {
     fn at(
@@ -46,15 +47,17 @@ impl Location {
             source,
             checked: false,
             inventory: Inventory::Waiting,
+            create_missing: false,
         }
     }
     fn set_path(&mut self, path: PathBuf) {
         self.path = Some(path);
         self.inventory = Inventory::Waiting;
+        self.create_missing = false;
     }
     fn preview(&self) -> Option<&Preview> {
         match &self.inventory {
-            Inventory::Ready(Ok(p)) => Some(p),
+            Inventory::Ready(Ok(p), _) => Some(p),
             _ => None,
         }
     }
@@ -65,6 +68,11 @@ impl Location {
     }
 }
 
+pub(super) enum Action {
+    Save(ReviewedSetup),
+    RemoveSlot(String),
+}
+
 pub(super) struct Review {
     rows: Vec<Location>,
     inspected: Option<usize>,
@@ -73,7 +81,7 @@ pub(super) struct Review {
     root_name: String,
     root_changes: BTreeMap<String, PathBuf>,
 }
-fn new_name(path: &Path, rows: &[Location]) -> String {
+fn new_name(path: &Path, rows: &[Location], retired: &BTreeSet<String>) -> String {
     let base: String = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -90,12 +98,12 @@ fn new_name(path: &Path, rows: &[Location]) -> String {
         .collect();
     let base = base.trim_matches('-');
     let base = if base.is_empty() { "saves" } else { base };
-    if rows.iter().all(|r| r.name != base) {
+    if !retired.contains(base) && rows.iter().all(|r| r.name != base) {
         return base.into();
     }
     (2..)
         .map(|n| format!("{base}-{n}"))
-        .find(|s| rows.iter().all(|r| r.name != *s))
+        .find(|s| !retired.contains(s) && rows.iter().all(|r| r.name != *s))
         .unwrap()
 }
 fn active_recipe<'a>(d: &'a Detail, shared: Option<&str>) -> Option<&'a Recipe> {
@@ -196,30 +204,15 @@ impl Review {
                 rows.push(row);
             }
         }
-        // Preserve a device binding even if a remote edit no longer contains its slot.
-        for (name, b) in &d.bindings {
-            if rows.iter().all(|r| r.name != *name)
-                && let Some(slot) = d.local_slots.get(name)
-            {
-                let mut row = Location::at(
-                    name.clone(),
-                    Some(b.path.clone()),
-                    slot.kind.clone(),
-                    slot.settings,
-                    slot.source.clone(),
-                );
-                row.checked = true;
-                rows.push(row);
-            }
-        }
         for c in &d.candidates {
             if rows.iter().any(|r| r.path.as_ref() == Some(&c.path)) {
                 continue;
             }
             let name = c
                 .slot
+                .filter(|name| !d.retired_slots.contains(*name))
                 .map(str::to_owned)
-                .unwrap_or_else(|| new_name(&c.path, &rows));
+                .unwrap_or_else(|| new_name(&c.path, &rows, &d.retired_slots));
             if let Some(row) = rows
                 .iter_mut()
                 .find(|r| r.name == name && r.path.is_none() && r.kind == c.kind)
@@ -244,7 +237,7 @@ impl Review {
                 Some(c.source.clone()),
             );
             row.checked = d.device.needs_locations()
-                && c.slot.is_some()
+                && c.slot.is_some_and(|name| !d.retired_slots.contains(name))
                 && !c.settings
                 && d.detected.get(&c.path) == Some(&c.kind);
             rows.push(row);
@@ -280,14 +273,14 @@ impl Review {
             root_changes: BTreeMap::new(),
         }
     }
-    fn inventory(&mut self, ui: &egui::Ui, home: &Path) {
+    fn inventory(&mut self, ui: &egui::Ui, home: &Path, d: &Detail) {
         for row in &mut self.rows {
             if let Inventory::Scanning { result, .. } = &row.inventory {
                 match result.try_recv() {
-                    Ok(value) => row.inventory = Inventory::Ready(value),
+                    Ok((value, missing)) => row.inventory = Inventory::Ready(value, missing),
                     Err(mpsc::TryRecvError::Empty) => return,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        row.inventory = Inventory::Ready(Err("File preview stopped".into()))
+                        row.inventory = Inventory::Ready(Err("File preview stopped".into()), false)
                     }
                 }
             }
@@ -302,6 +295,20 @@ impl Review {
             .or_else(|| self.rows.iter().position(|r| r.checked && waiting(r)));
         if let Some(i) = next {
             let row = &mut self.rows[i];
+            let base = if !row.unchanged(d) {
+                active_recipe(d, self.shared.as_deref())
+                    .and_then(|recipe| recipe.slots.get(&row.name))
+                    .and_then(|slot| slot_location(slot, d, &self.root_changes))
+                    .and_then(|location| {
+                        self.root_changes
+                            .get(&location.root)
+                            .or_else(|| d.roots.get(&location.root))
+                    })
+                    .cloned()
+            } else {
+                None
+            };
+            let create_missing = row.create_missing;
             let (home, path, kind, name) = (
                 home.to_owned(),
                 row.path.clone().unwrap(),
@@ -312,10 +319,25 @@ impl Review {
             let (alive, cancel) = mpsc::channel();
             let ctx = ui.ctx().clone();
             thread::spawn(move || {
-                let v = crate::files::preview(&home, &path, kind, &name, || {
-                    cancel.try_recv() == Err(mpsc::TryRecvError::Disconnected)
-                });
-                let _ = tx.send(v.map_err(|e| format!("{e:#}")));
+                let cancelled = || cancel.try_recv() == Err(mpsc::TryRecvError::Disconnected);
+                let v = crate::files::preview(&home, &path, kind.clone(), &name, cancelled);
+                let missing = if v.is_err() {
+                    base.as_ref().and_then(|base| {
+                        crate::files::preview_missing(&home, &path, kind, &name, base, cancelled)
+                            .ok()
+                    })
+                } else {
+                    None
+                };
+                let (v, missing) = if create_missing {
+                    match missing {
+                        Some(p) => (Ok(p), false),
+                        None => (v, false),
+                    }
+                } else {
+                    (v, missing.is_some())
+                };
+                let _ = tx.send((v.map_err(|e| format!("{e:#}")), missing));
                 ctx.request_repaint();
             });
             row.inventory = Inventory::Scanning {
@@ -335,7 +357,7 @@ impl Review {
         self.rows[index].checked = checked;
         self.inspected = Some(index);
     }
-    fn browse(&mut self, kind: Kind, index: Option<usize>) {
+    fn browse(&mut self, kind: Kind, index: Option<usize>, d: &Detail) {
         let mut dialog = rfd::FileDialog::new();
         if let Some(root) = self.browse_from.as_ref() {
             dialog = dialog.set_directory(root);
@@ -355,14 +377,14 @@ impl Review {
         {
             i
         } else {
-            let name = new_name(&path, &self.rows);
+            let name = new_name(&path, &self.rows, &d.retired_slots);
             self.rows
                 .push(Location::at(name, Some(path), kind, false, None));
             self.rows.len() - 1
         };
         self.pick(index, true);
     }
-    fn rows(&mut self, ui: &mut egui::Ui) {
+    fn rows(&mut self, ui: &mut egui::Ui, d: &Detail) {
         let mut pick = None;
         if self.rows.is_empty() {
             ui.weak("No locations detected");
@@ -379,11 +401,16 @@ impl Review {
                         pick = Some((i, checked));
                     }
                     ui.vertical(|ui| {
-                        let row_label = if r.settings {
-                            format!("{} · Settings", r.name)
-                        } else {
-                            r.name.clone()
-                        };
+                        let mut row_label = r.name.clone();
+                        if r.settings {
+                            row_label.push_str(" · Settings");
+                        }
+                        if r.source.is_some()
+                            && !active_recipe(d, self.shared.as_deref())
+                                .is_some_and(|recipe| recipe.slots.contains_key(&r.name))
+                        {
+                            row_label.push_str(" · Suggested");
+                        }
                         if ui
                             .selectable_label(self.inspected == Some(i), row_label)
                             .clicked()
@@ -433,10 +460,10 @@ impl Review {
             }
         }
     }
-    fn included(&mut self, ui: &mut egui::Ui, d: &Detail) {
+    fn included(&mut self, ui: &mut egui::Ui, d: &Detail) -> Option<String> {
         let Some(i) = self.inspected else {
             ui.weak("Select a location to preview");
-            return;
+            return None;
         };
         let row = &mut self.rows[i];
         ui.strong(&row.name);
@@ -450,8 +477,25 @@ impl Review {
                 .wrap(),
             );
         }
+        let slot = active_recipe(d, self.shared.as_deref()).and_then(|r| r.slots.get(&row.name));
+        let can_create =
+            matches!(&row.inventory, Inventory::Ready(Err(_), true)) || row.create_missing;
+        if can_create
+            && ui
+                .checkbox(
+                    &mut row.create_missing,
+                    if row.kind == Kind::Folder {
+                        "Create missing folder when saved"
+                    } else {
+                        "Create missing parent folders when saved"
+                    },
+                )
+                .changed()
+        {
+            row.inventory = Inventory::Waiting;
+        }
         match &row.inventory {
-            Inventory::Ready(Ok(p)) => {
+            Inventory::Ready(Ok(p), _) => {
                 ui.label(format!(
                     "{} · {}",
                     file_count(p.files.len()),
@@ -473,7 +517,10 @@ impl Review {
                         });
                 }
             }
-            Inventory::Ready(Err(e)) => {
+            Inventory::Ready(Err(_), true) => {
+                ui.weak("Destination does not exist yet");
+            }
+            Inventory::Ready(Err(e), _) => {
                 ui.colored_label(ui.visuals().error_fg_color, e);
             }
             _ if row.path.is_some() => {
@@ -485,7 +532,6 @@ impl Review {
             ui.label(RichText::new(source).size(12.).color(phase::MUTED))
                 .on_hover_text(source);
         }
-        let slot = active_recipe(d, self.shared.as_deref()).and_then(|r| r.slots.get(&row.name));
         let fixed = slot.is_some();
         let mut missing_roots = BTreeMap::new();
         if row.path.is_none()
@@ -520,13 +566,22 @@ impl Review {
                 redo = ui.button("Change location…").clicked();
             }
         });
+        let remove = d
+            .own
+            .as_ref()
+            .is_some_and(|r| r.slots.contains_key(&row.name))
+            && ui
+                .add_enabled(!d.offline, egui::Button::new("Remove from recipe…"))
+                .clicked();
+        let name = row.name.clone();
         if (row.path.is_none() && ui.button("Choose location…").clicked()) || redo {
             let kind = row.kind.clone();
-            self.browse(kind, Some(i));
+            self.browse(kind, Some(i), d);
         }
         if let Some(name) = map_root {
             self.map_root(d, &name);
         }
+        remove.then_some(name)
     }
     fn selection(&self, d: &Detail, title: &str) -> Result<ReviewedSetup, String> {
         if d.offline && d.device == crate::setup::DeviceState::New {
@@ -539,7 +594,7 @@ impl Review {
         let mut names = BTreeSet::new();
         let mut paths: Vec<&Path> = vec![];
         for r in self.rows.iter().filter(|r| r.checked) {
-            if !key(&r.name) || !names.insert(r.name.clone()) {
+            if !key(&r.name) || d.retired_slots.contains(&r.name) || !names.insert(r.name.clone()) {
                 return Err("Use a unique selection name for each location".into());
             }
             let path = r.path.as_deref().ok_or("Choose a location")?;
@@ -596,8 +651,8 @@ impl Review {
         d: &Detail,
         title: &str,
         home: &Path,
-    ) -> Option<ReviewedSetup> {
-        self.inventory(ui, home);
+    ) -> Option<Action> {
+        self.inventory(ui, home, d);
         if d.own.is_none() && !d.shared_options.is_empty() {
             let mut shared = self.shared.clone();
             egui::ComboBox::from_label("File recipe")
@@ -647,7 +702,7 @@ impl Review {
                 for (kind, label) in [(Kind::Folder,"Choose folder…"), (Kind::File,"Choose file…")] {
                     if ui.button(label).clicked(){
                         ui.close();
-                        self.browse(kind, None);
+                        self.browse(kind, None, d);
                     }
                 }
             });
@@ -656,19 +711,64 @@ impl Review {
                     .on_hover_text("Disable overlapping Steam Cloud saves before syncing the same files with Buddy.");
             }
         });
+        let mut remove = None;
+        if let Some(recipe) = active_recipe(d, self.shared.as_deref()) {
+            let mut roots = BTreeSet::new();
+            for slot in recipe.slots.values() {
+                if let Some(location) = slot.locations.get(&d.platform) {
+                    if crate::local::validate_root_name(&location.root).is_ok() {
+                        roots.insert(location.root.clone());
+                    }
+                } else {
+                    for location in slot.locations.values() {
+                        if crate::local::validate_root_name(&location.root).is_ok() {
+                            roots.insert(location.root.clone());
+                        }
+                    }
+                }
+            }
+            for name in roots {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(&name);
+                    if let Some(path) = self
+                        .root_changes
+                        .get(&name)
+                        .or_else(|| d.named_roots.get(&name))
+                    {
+                        ui.label(path.display().to_string());
+                    } else {
+                        ui.colored_label(phase::ORANGE, "Choose directory");
+                    }
+                    if ui
+                        .button(
+                            if self.root_changes.contains_key(&name)
+                                || d.named_roots.contains_key(&name)
+                            {
+                                "Change…"
+                            } else {
+                                "Map…"
+                            },
+                        )
+                        .clicked()
+                    {
+                        self.map_root(d, &name);
+                    }
+                });
+            }
+        }
         if ui.available_width() >= 660. {
             ui.columns(2, |cols| {
                 phase::panel().show(&mut cols[0], |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.label(RichText::new("Locations").size(19.).strong());
                     ui.separator();
-                    self.rows(ui);
+                    self.rows(ui, d);
                 });
                 phase::panel().show(&mut cols[1], |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.label(RichText::new("Included files").size(19.).strong());
                     ui.separator();
-                    self.included(ui, d);
+                    remove = self.included(ui, d);
                 });
             });
         } else {
@@ -676,14 +776,17 @@ impl Review {
                 ui.set_min_width(ui.available_width());
                 ui.label(RichText::new("Locations").size(19.).strong());
                 ui.separator();
-                self.rows(ui);
+                self.rows(ui, d);
             });
             phase::panel().show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.label(RichText::new("Included files").size(19.).strong());
                 ui.separator();
-                self.included(ui, d);
+                remove = self.included(ui, d);
             });
+        }
+        if let Some(slot) = remove {
+            return Some(Action::RemoveSlot(slot));
         }
         ui.collapsing("Custom root directories", |ui| {
             for (k, v) in d
@@ -741,7 +844,7 @@ impl Review {
             })
             .inner;
         if save {
-            return selected.ok();
+            return selected.ok().map(Action::Save);
         }
         None
     }

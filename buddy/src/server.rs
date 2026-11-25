@@ -135,6 +135,7 @@ impl Store {
           CREATE TABLE IF NOT EXISTS attempts(peer TEXT PRIMARY KEY, starts INTEGER NOT NULL,n INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS games(account TEXT,game TEXT,recipe TEXT NOT NULL,revision INTEGER NOT NULL,shared INTEGER NOT NULL,head INTEGER,
             generation INTEGER NOT NULL DEFAULT 0,holder TEXT,session TEXT,since INTEGER,expires INTEGER,PRIMARY KEY(account,game));
+          CREATE TABLE IF NOT EXISTS retired_slots(account TEXT,game TEXT,name TEXT,kind TEXT NOT NULL,PRIMARY KEY(account,game,name));
           CREATE TABLE IF NOT EXISTS objects(account TEXT,hash TEXT,bytes BLOB NOT NULL,touched INTEGER NOT NULL,PRIMARY KEY(account,hash));
           CREATE TABLE IF NOT EXISTS versions(id INTEGER PRIMARY KEY AUTOINCREMENT,account TEXT NOT NULL,game TEXT NOT NULL,origin TEXT NOT NULL,
             created INTEGER NOT NULL,tree TEXT NOT NULL,pin TEXT NOT NULL DEFAULT '',published INTEGER NOT NULL);
@@ -181,10 +182,12 @@ pub fn init_config() -> Result<()> {
     let mut config = tempfile::NamedTempFile::new_in(".").context("create server.toml")?;
     config.write_all(include_bytes!("../../server.example.toml"))?;
     config.as_file().sync_all()?;
-    config
-        .persist_noclobber("server.toml")
-        .map_err(|err| err.error)
-        .context("create server.toml")?;
+    if let Err(err) = config.persist_noclobber("server.toml") {
+        if err.error.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::bail!("server.toml already exists");
+        }
+        return Err(err.error).context("create server.toml");
+    }
     Ok(())
 }
 pub fn serve(path: &Path) -> Result<()> {
@@ -552,6 +555,30 @@ fn preserve(tx: &Transaction, u: &User, g: &Game, local: &Tree, time: i64) -> Re
     )?;
     Ok(id)
 }
+fn publish_head(tx: &Transaction, u: &User, g: &Game, id: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE games SET head=? WHERE account=? AND game=?",
+        params![id, u.account, g.recipe.game],
+    )?;
+    tx.execute("DELETE FROM versions WHERE account=?1 AND game=?2 AND published AND pin='' AND id NOT IN (SELECT id FROM versions WHERE account=?1 AND game=?2 AND published AND pin='' AND id<>?3 ORDER BY id DESC LIMIT ?4) AND id<>?3",params![u.account,g.recipe.game,id,g.recipe.retention])?;
+    Ok(())
+}
+fn retired_slots(
+    tx: &Transaction,
+    u: &User,
+    game: &str,
+) -> Result<std::collections::BTreeMap<String, Kind>> {
+    let mut stmt =
+        tx.prepare_cached("SELECT name,kind FROM retired_slots WHERE account=? AND game=?")?;
+    let mut slots = std::collections::BTreeMap::new();
+    for row in stmt.query_map(params![u.account, game], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (name, kind) = row?;
+        slots.insert(name, serde_json::from_str(&kind)?);
+    }
+    Ok(slots)
+}
 fn remember(tx: &Transaction, u: &User, op: &str, request: &str, result: i64) -> Result<Value> {
     ensure!(key(op), "invalid operation id");
     tx.execute(
@@ -586,8 +613,14 @@ fn apply(tx: &Transaction, u: &User, a: Action) -> Result<Value> {
             let mut list = vec![];
             for row in rows {
                 let (s, revision, shared) = row?;
+                let recipe: Recipe = serde_json::from_str(&s)?;
                 list.push(GameInfo {
-                    recipe: serde_json::from_str(&s)?,
+                    retired_slots: if catalog {
+                        Default::default()
+                    } else {
+                        retired_slots(tx, u, &recipe.game)?.into_keys().collect()
+                    },
+                    recipe,
                     revision,
                     shared,
                 });
@@ -602,9 +635,22 @@ fn apply(tx: &Transaction, u: &User, a: Action) -> Result<Value> {
             recipe.validate()?;
             let encoded = serde_json::to_string(&recipe)?;
             let n = if expected == 0 {
+                ensure!(
+                    !recipe.slots.is_empty(),
+                    "choose a location to enroll this game"
+                );
                 tx.execute("INSERT OR IGNORE INTO games(account,game,recipe,revision,shared) VALUES(?,?,?,1,?)",params![u.account,recipe.game,encoded,shared])?
             } else {
                 let prior = game(tx, u, &recipe.game)?;
+                if prior.revision != expected || prior.holder.is_some() {
+                    return Err(stale());
+                }
+                for name in retired_slots(tx, u, &recipe.game)?.keys() {
+                    ensure!(
+                        !recipe.slots.contains_key(name),
+                        "slot {name} was removed from this recipe; choose a new slot ID"
+                    );
+                }
                 // Old snapshots keep their logical IDs; new bindings require explicit device approval.
                 for (name, slot) in prior.recipe.slots {
                     ensure!(
@@ -618,6 +664,48 @@ fn apply(tx: &Transaction, u: &User, a: Action) -> Result<Value> {
                 return Err(stale());
             }
             Ok(json!(expected + 1))
+        }
+        Action::RemoveSlot {
+            game: name,
+            slot,
+            expected,
+        } => {
+            let mut g = game(tx, u, &name)?;
+            if g.revision != expected || g.holder.is_some() {
+                return Err(denied(
+                    StatusCode::PRECONDITION_FAILED,
+                    "recipe changed or a device is playing; refresh and try again",
+                ));
+            }
+            let removed = g
+                .recipe
+                .slots
+                .remove(&slot)
+                .context("slot is absent from this recipe")?;
+            tx.execute(
+                "INSERT INTO retired_slots VALUES(?,?,?,?)",
+                params![u.account, name, slot, serde_json::to_string(&removed.kind)?],
+            )?;
+            tx.execute(
+                "UPDATE games SET recipe=?,revision=revision+1 WHERE account=? AND game=?",
+                params![serde_json::to_string(&g.recipe)?, u.account, name],
+            )?;
+            if let Some(id) = g.head {
+                let mut live = version(tx, u, &name, id)?.tree;
+                let before = live.0.len();
+                live.0
+                    .retain(|path, _| path.split('/').next() != Some(slot.as_str()));
+                if live.0.len() != before {
+                    let id = snapshot(tx, u, &g, &live, now(), "", true)?;
+                    publish_head(tx, u, &g, id)?;
+                }
+            }
+            Ok(json!(GameInfo {
+                recipe: g.recipe,
+                revision: expected + 1,
+                shared: g.shared,
+                retired_slots: retired_slots(tx, u, &name)?.into_keys().collect()
+            }))
         }
         Action::Acquire {
             game: g,
@@ -651,6 +739,7 @@ fn apply(tx: &Transaction, u: &User, a: Action) -> Result<Value> {
             let generation = state.generation + i64::from(!same);
             tx.execute("UPDATE games SET generation=?,holder=?,session=?,since=?,expires=? WHERE account=? AND game=?",params![generation,u.device,session,if same{state.since}else{now()},now()+120,u.account,g])?;
             let head = state.head.map(|i| version(tx, u, &g, i)).transpose()?;
+            let retired_slots = retired_slots(tx, u, &g)?.into_keys().collect();
             Ok(json!(Acquisition::Granted {
                 lease: Lease {
                     game: g,
@@ -661,6 +750,7 @@ fn apply(tx: &Transaction, u: &User, a: Action) -> Result<Value> {
                 recipe: state.recipe,
                 revision: state.revision,
                 shared: state.shared,
+                retired_slots,
             }))
         }
         Action::Renew { lease } => {
@@ -705,11 +795,7 @@ fn apply(tx: &Transaction, u: &User, a: Action) -> Result<Value> {
                 Some(r) if r.tree == tree => r.id,
                 _ => snapshot(tx, u, &g, &tree, now(), "", true)?,
             };
-            tx.execute(
-                "UPDATE games SET head=? WHERE account=? AND game=?",
-                params![id, u.account, lease.game],
-            )?;
-            tx.execute("DELETE FROM versions WHERE account=?1 AND game=?2 AND published AND pin='' AND id NOT IN (SELECT id FROM versions WHERE account=?1 AND game=?2 AND published AND pin='' AND id<>?3 ORDER BY id DESC LIMIT ?4) AND id<>?3",params![u.account,lease.game,id,g.recipe.retention])?;
+            publish_head(tx, u, &g, id)?;
             if close {
                 release(tx, u, &lease.game)?;
             }
@@ -736,7 +822,27 @@ fn apply(tx: &Transaction, u: &User, a: Action) -> Result<Value> {
             time,
             op,
         } => {
-            let g = game(tx, u, &g)?;
+            let mut g = game(tx, u, &g)?;
+            // A disconnected session can contain progress for a slot since removed.
+            // Its backup may use historical IDs while the published head stays on the current recipe.
+            let historical = slots.iter().any(|name| !g.recipe.slots.contains_key(name));
+            if historical {
+                let retired = retired_slots(tx, u, &g.recipe.game)?;
+                for name in &slots {
+                    if let Some(kind) = retired.get(name) {
+                        g.recipe.slots.insert(
+                            name.clone(),
+                            Slot {
+                                kind: kind.clone(),
+                                codec: raw_codec(),
+                                settings: false,
+                                source: None,
+                                locations: Default::default(),
+                            },
+                        );
+                    }
+                }
+            }
             let mut scope = g.recipe.clone();
             ensure!(
                 slots.iter().all(|k| scope.slots.contains_key(k)),
@@ -751,7 +857,11 @@ fn apply(tx: &Transaction, u: &User, a: Action) -> Result<Value> {
                 .map(|v| v.tree)
                 .unwrap_or_default();
             let full = prior.overlay(&scope, &local);
-            let id = preserve(tx, u, &g, &full, time)?;
+            let id = if historical {
+                snapshot(tx, u, &g, &full, time, "offline", false)?
+            } else {
+                preserve(tx, u, &g, &full, time)?
+            };
             remember(tx, u, &op, &fingerprint, id)
         }
         Action::Backups { game: g } => {

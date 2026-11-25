@@ -100,6 +100,8 @@ enum Cmd {
     Games,
     /// Stop syncing one selection on this device.
     Unbind { game: String, slot: String },
+    /// Remove a location from this account's recipe on every device. Keeps local files.
+    RemoveSlot { game: String, slot: String },
     /// List explicitly shared file recipes.
     Catalog,
     /// Index a local Ludusavi YAML catalog for path suggestions.
@@ -283,6 +285,23 @@ fn dispatch(args: Args) -> Result<i32> {
                 }
                 Cmd::Root { game, name, path } => l.bind_root(&game, &name, &path)?,
                 Cmd::Unbind { game, slot } => setup::unbind(&l, &game, &slot)?,
+                Cmd::RemoveSlot { game, slot } => {
+                    let c = l.credentials()?;
+                    let games: Vec<GameInfo> = Api::new(c.clone())?.rpc(Action::Games)?;
+                    let remote = games
+                        .iter()
+                        .find(|g| g.recipe.game == game)
+                        .ok_or_else(|| anyhow::anyhow!("game has no recipe on this account"))?;
+                    let base = setup::ReviewBase::new(
+                        &l,
+                        &c,
+                        &game,
+                        l.maybe_setup(&c, &game)?.as_ref(),
+                        &l.named_roots(&c, &game)?,
+                        Some(remote.revision),
+                    )?;
+                    setup::remove_slot(&l, &base, &slot)?;
+                }
                 Cmd::ApplySetup { game, interactive } => {
                     setup::review(&l, &game, cli_decisions(interactive), false)?
                 }

@@ -43,6 +43,8 @@ pub struct Setup {
     #[serde(default)]
     pub draft: Option<crate::setup::Draft>,
     pub recipe: Recipe,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub retired_slots: std::collections::BTreeSet<String>,
     pub revision: i64,
     pub shared: bool,
     pub bindings: BTreeMap<String, Binding>,
@@ -67,6 +69,7 @@ impl Setup {
             bindings_cleared: false,
             approved_proton_prefix: None,
             recipe: info.recipe,
+            retired_slots: info.retired_slots,
             revision: info.revision,
             shared: info.shared,
             bindings: BTreeMap::new(),

@@ -1,6 +1,6 @@
 use crate::session::Interface;
 use crate::{
-    files::Binding,
+    files::{Binding, ReviewedBinding},
     local::{Api, Local, Setup, discover, location, roots},
     model::*,
 };
@@ -61,7 +61,7 @@ impl ReviewBase {
 
 pub struct ReviewedSetup {
     pub title: String,
-    pub approved: Vec<(Selection, Binding)>,
+    pub approved: Vec<(Selection, ReviewedBinding)>,
     pub removed: Vec<String>,
     pub shared_recipe: Option<String>,
     pub root_changes: BTreeMap<String, PathBuf>,
@@ -100,7 +100,7 @@ fn validate_review(
 ) -> Result<()> {
     recipe.validate()?;
     let mut bindings = existing.clone();
-    bindings.retain(|name, _| !edits.removed.contains(name));
+    bindings.retain(|name, _| recipe.slots.contains_key(name) && !edits.removed.contains(name));
     bindings.extend(draft.bindings.clone());
     if !bindings.is_empty() {
         let mut device_recipe = recipe.clone();
@@ -174,6 +174,7 @@ pub fn save_review(local: &Local, base: &ReviewBase, edits: ReviewedSetup) -> Re
                     GameInfo {
                         recipe,
                         revision: 0,
+                        retired_slots: Default::default(),
                         shared: false,
                     }
                 }
@@ -212,18 +213,83 @@ pub fn save_review(local: &Local, base: &ReviewBase, edits: ReviewedSetup) -> Re
             .insert(name.clone(), (named.get(&name).cloned(), binding));
     }
 
-    let mut draft = Draft::new(remote.clone());
-    let platform = runtime(&base.game);
-    for (sel, reviewed) in edits.approved {
+    // Reject invalid selections before creating any missing destinations.
+    let mut selected: Vec<PathBuf> = s
+        .bindings
+        .iter()
+        .filter(|(name, _)| {
+            remote.recipe.slots.contains_key(*name)
+                && !changes.removed.contains(*name)
+                && !edits.approved.iter().any(|(sel, _)| &sel.slot == *name)
+        })
+        .map(|(_, binding)| binding.path.clone())
+        .collect();
+    let mut names = BTreeSet::new();
+    let mut approved = edits.approved;
+    for (sel, reviewed) in &mut approved {
         ensure!(
             sel.game == base.game
                 && key(&sel.slot)
                 && !changes.removed.contains(&sel.slot)
-                && !draft.bindings.contains_key(&sel.slot),
+                && names.insert(sel.slot.clone()),
             "invalid or duplicate selection: {}",
             sel.slot
         );
-        draft.bind(sel, Some(&reviewed), &platform, &available)?;
+        ensure!(
+            !remote.retired_slots.contains(&sel.slot),
+            "slot {} was removed; choose a new slot ID",
+            sel.slot
+        );
+        let slot = remote.recipe.slots.get(&sel.slot);
+        ensure!(
+            slot.is_none_or(|slot| slot.kind == sel.kind),
+            "the server expects a different file type for {}",
+            sel.slot
+        );
+        let path = match &*reviewed {
+            ReviewedBinding::Existing(binding) => {
+                reviewed.validate(&sel.path, &sel.kind)?;
+                binding.path.clone()
+            }
+            ReviewedBinding::Missing { base, relative, .. } => {
+                ensure!(
+                    !s.bindings.contains_key(&sel.slot),
+                    "previously approved location disappeared; reconnect it or choose another"
+                );
+                let path = base.path.join(relative);
+                ensure!(
+                    slot.is_some_and(|slot| slot.locations.values().any(|loc| {
+                        available.get(&loc.root).is_some_and(|root| {
+                            root.canonicalize().ok().as_ref() == Some(&base.path)
+                                && std::path::Path::new(&loc.relative) == relative
+                                && (root.join(&loc.relative) == sel.path || path == sel.path)
+                        })
+                    })),
+                    "destination is not the reviewed recipe location"
+                );
+                reviewed.validate(&path, &sel.kind)?;
+                path
+            }
+        };
+        ensure!(
+            !path.starts_with(&local.home) && !local.home.starts_with(&path),
+            "save selection overlaps Buddy's own data"
+        );
+        ensure!(
+            !selected
+                .iter()
+                .any(|p| p.starts_with(&path) || path.starts_with(p)),
+            "overlapping selections"
+        );
+        selected.push(path.clone());
+        sel.path = path;
+    }
+    let mut draft = Draft::new(remote.clone());
+    let platform = runtime(&base.game);
+    let mut created = BTreeMap::new();
+    for (sel, reviewed) in approved {
+        let binding = reviewed.resolve_with_created(&sel.path, &sel.kind, &mut created)?;
+        draft.bind(sel, binding, &platform, &available)?;
     }
     validate_review(
         &draft.desired.recipe,
@@ -292,6 +358,7 @@ pub fn bind(local: &Local, sel: Selection, reviewed: Option<&Binding>) -> Result
                     GameInfo {
                         recipe,
                         shared: false,
+                        retired_slots: Default::default(),
                         revision: 0,
                     },
                     true,
@@ -307,11 +374,17 @@ pub fn bind(local: &Local, sel: Selection, reviewed: Option<&Binding>) -> Result
         Err(e) => return Err(e),
     };
     let mut s = setup.unwrap_or_else(|| Setup::new(info.clone()));
+    ensure!(
+        !info.retired_slots.contains(&sel.slot),
+        "slot {} was removed from this recipe; choose a new --slot ID",
+        sel.slot
+    );
     let mut draft = s.draft.clone().unwrap_or_else(|| Draft::new(info.clone()));
     let platform = runtime(&sel.game);
     let mut available = roots(&sel.game);
     available.extend(local.named_roots(&c, &sel.game)?);
-    draft.bind(sel, reviewed, &platform, &available)?;
+    let binding = Binding::for_selection(&sel.path, &sel.kind, reviewed)?;
+    draft.bind(sel, binding, &platform, &available)?;
     draft.desired.recipe.validate()?;
     s.draft = Some(draft);
     local.save(&c, &s)?;
@@ -332,11 +405,10 @@ impl Draft {
     fn bind(
         &mut self,
         sel: Selection,
-        reviewed: Option<&Binding>,
+        binding: Binding,
         platform: &str,
         available: &BTreeMap<String, PathBuf>,
     ) -> Result<()> {
-        let binding = Binding::for_selection(&sel.path, &sel.kind, reviewed)?;
         let slot = self
             .desired
             .recipe
@@ -380,6 +452,7 @@ fn info(s: &Setup) -> GameInfo {
         recipe: s.recipe.clone(),
         revision: s.revision,
         shared: s.shared,
+        retired_slots: s.retired_slots.clone(),
     }
 }
 pub fn idle(s: &Setup) -> bool {
@@ -435,6 +508,10 @@ fn apply(local: &Local, api: &Api, s: &mut Setup, remote: &GameInfo, ui: Interfa
         if prior == Some(slot) {
             continue;
         }
+        ensure!(
+            !remote.retired_slots.contains(name),
+            "slot {name} was removed; discard this draft and review the remaining locations"
+        );
         let merged = if let Some(r) = current
             && r.kind == slot.kind
         {
@@ -481,6 +558,10 @@ fn apply(local: &Local, api: &Api, s: &mut Setup, remote: &GameInfo, ui: Interfa
     next.validate()?;
     for name in d.bindings.keys() {
         ensure!(
+            !remote.retired_slots.contains(name),
+            "slot {name} was removed; discard this draft and review the remaining locations"
+        );
+        ensure!(
             next.slots.get(name).map(|s| &s.kind) == ours.slots.get(name).map(|s| &s.kind),
             "selection {name} changed type; discard the draft and bind it again"
         );
@@ -514,11 +595,16 @@ fn apply(local: &Local, api: &Api, s: &mut Setup, remote: &GameInfo, ui: Interfa
         }
         s.bindings.insert(name.clone(), b.clone());
     }
-    s.recipe = next;
-    s.shared = shared;
-    s.revision = rev;
     s.draft = None;
-    rescope(s);
+    accept_recipe(
+        s,
+        GameInfo {
+            recipe: next,
+            shared,
+            revision: rev,
+            retired_slots: remote.retired_slots.clone(),
+        },
+    );
     if let Some(roots) = checked_roots {
         local.save_setup_with_roots(&api.c, s, &roots)
     } else {
@@ -567,6 +653,48 @@ fn rescope(s: &mut Setup) {
         .slots
         .retain(|name, _| s.bindings.contains_key(name));
     s.base = s.base.as_ref().map(|base| base.project(&selected));
+}
+// Callers with pending sessions archive changes to retired slots before adopting
+// the recipe. Each remaining session keeps its own comparison base and order.
+pub fn accept_recipe(s: &mut Setup, info: GameInfo) {
+    let had_bindings = !s.bindings.is_empty();
+    s.bindings
+        .retain(|name, _| info.recipe.slots.contains_key(name));
+    if had_bindings && s.bindings.is_empty() {
+        s.bindings_cleared = true;
+        s.approved_proton_prefix = None;
+        s.needs_first_pull = false;
+    }
+    s.recipe = info.recipe;
+    s.revision = info.revision;
+    s.shared = info.shared;
+    s.retired_slots = info.retired_slots;
+    rescope(s);
+}
+pub fn remove_slot(local: &Local, base: &ReviewBase, slot: &str) -> Result<()> {
+    let c = local.credentials()?;
+    let _lock = local.lock(&format!("{}:{}", local.scope(&c), base.game))?;
+    let mut setup = local.maybe_setup(&c, &base.game)?;
+    let named = local.named_roots(&c, &base.game)?;
+    let current = ReviewBase::new(local, &c, &base.game, setup.as_ref(), &named, None)?;
+    ensure!(
+        current.identity == base.identity,
+        "account or setup changed since review; reopen setup"
+    );
+    ensure!(
+        setup.as_ref().is_none_or(|s| idle(s) && s.draft.is_none()),
+        "finish pending sessions and setup edits before removing a recipe location"
+    );
+    let remote = Api::new(c.clone())?.rpc(Action::RemoveSlot {
+        game: base.game.clone(),
+        slot: slot.to_owned(),
+        expected: base.expected_revision,
+    })?;
+    if let Some(s) = &mut setup {
+        accept_recipe(s, remote);
+        local.save(&c, s)?;
+    }
+    Ok(())
 }
 pub fn unbind(local: &Local, game: &str, slot: &str) -> Result<()> {
     let c = local.credentials()?;
@@ -636,6 +764,7 @@ pub fn import(local: &Local, game: &str, hash: &str) -> Result<()> {
                 &c,
                 &Setup::new(GameInfo {
                     recipe: info.recipe,
+                    retired_slots: Default::default(),
                     revision: rev,
                     shared: false,
                 }),

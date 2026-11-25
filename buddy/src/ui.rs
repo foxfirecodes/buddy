@@ -41,13 +41,13 @@ struct Detail {
     account_scope: String,
     game: String,
     own: Option<Recipe>,
+    retired_slots: std::collections::BTreeSet<String>,
     shared_options: Vec<(String, Recipe)>,
     candidates: Vec<crate::manifest::Suggestion>,
     detected: BTreeMap<PathBuf, Kind>,
     baseline: setup::ReviewBase,
     device: DeviceState,
     has_account_recipe: bool,
-    local_slots: BTreeMap<String, Slot>,
     bindings: BTreeMap<String, Binding>,
     named_roots: BTreeMap<String, PathBuf>,
     roots: BTreeMap<String, PathBuf>,
@@ -272,6 +272,11 @@ impl App {
             let shared = remote
                 .as_ref()
                 .map_or_else(|| s.as_ref().is_some_and(|s| s.shared), |r| r.shared);
+            let retired_slots = remote
+                .as_ref()
+                .map(|g| g.retired_slots.clone())
+                .or_else(|| s.as_ref().map(|s| s.retired_slots.clone()))
+                .unwrap_or_default();
             let own = remote.map(|g| g.recipe).or_else(|| {
                 s.as_ref()
                     .filter(|s| !s.recipe.slots.is_empty())
@@ -301,17 +306,27 @@ impl App {
             } else {
                 (vec![], offline)
             };
+            let device = match s.as_ref() {
+                Some(setup)
+                    if !setup.bindings.is_empty()
+                        && setup
+                            .bindings
+                            .keys()
+                            .all(|name| retired_slots.contains(name))
+                        && setup::idle(setup)
+                        && setup.draft.is_none() =>
+                {
+                    DeviceState::Paused
+                }
+                _ => DeviceState::from_setup(s.as_ref()),
+            };
             let mut detail = Detail {
                 account_scope: l.scope(&c),
                 detected: BTreeMap::new(),
                 baseline,
-                device: DeviceState::from_setup(s.as_ref()),
+                device,
                 has_account_recipe,
                 platform: setup::runtime(&game),
-                local_slots: s
-                    .as_ref()
-                    .map(|s| s.recipe.slots.clone())
-                    .unwrap_or_default(),
                 bindings: s.as_ref().map(|s| s.bindings.clone()).unwrap_or_default(),
                 draft: s.as_ref().is_some_and(|s| s.draft.is_some()),
                 shared,
@@ -323,6 +338,7 @@ impl App {
                 named_roots,
                 game,
                 own,
+                retired_slots,
                 shared_options,
                 backups,
                 offline,
@@ -528,7 +544,20 @@ impl App {
             });
             #[cfg(target_os = "linux")]
             let new_proton_game = d.device.needs_locations() && game.starts_with("steam-");
-            if let Some(changes) = review.show(ui, d, &self.title, &self.local.home) {
+            if let Some(action) = review.show(ui, d, &self.title, &self.local.home) {
+                if let review::Action::RemoveSlot(slot) = action {
+                    let base = d.baseline.clone();
+                    self.job(move |local| {
+                        let message = format!("Remove {slot} from the recipe for all devices? Local files stay on disk. Unsaved setup edits will be discarded.");
+                        ensure!(choose("Remove from recipe", &message, &["Cancel", "Remove"])? == 1, "cancelled");
+                        setup::remove_slot(&local, &base, &slot)?;
+                        Ok(Event::Done("Location removed from recipe".into()))
+                    });
+                    return;
+                }
+                let review::Action::Save(changes) = action else {
+                    unreachable!()
+                };
                 let base = d.baseline.clone();
                 let stopping_all = !d.bindings.is_empty()
                     && changes.approved.is_empty()
@@ -544,7 +573,7 @@ impl App {
                         };
                         let removed = changes.removed.join(", ");
                         let message = format!(
-                            "Stop syncing {removed} on this device? Local files and server history will be kept."
+                            "Stop syncing {removed} on this device? Local files stay on disk."
                         );
                         ensure!(
                             choose(title, &message, &["Cancel", "Save setup"])? == 1,
@@ -554,7 +583,9 @@ impl App {
                     if let Err(error) = setup::save_review(&local, &base, changes) {
                         let credentials = local.credentials()?;
                         if local.scope(&credentials) == scope
-                            && local.maybe_setup(&credentials, &game)?.is_some_and(|s| s.draft.is_some())
+                            && local
+                                .maybe_setup(&credentials, &game)?
+                                .is_some_and(|s| s.draft.is_some())
                         {
                             return Ok(Event::ReviewStaged(format!("{error:#}")));
                         }
@@ -612,10 +643,14 @@ impl App {
             ui.set_min_width(ui.available_width());
             ui.label(RichText::new("Synced locations").strong().size(19.));
             ui.separator();
-            if d.bindings.is_empty() {
+            let live = d
+                .bindings
+                .iter()
+                .filter(|(name, _)| !d.retired_slots.contains(*name));
+            if live.clone().next().is_none() {
                 ui.weak("No locations enabled on this device");
             }
-            for (name, b) in &d.bindings {
+            for (name, b) in live {
                 ui.horizontal_wrapped(|ui| {
                     ui.strong(name);
                     ui.add(

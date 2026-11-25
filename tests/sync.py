@@ -41,7 +41,8 @@ def main(root, address):
     host = f"[{address}]" if address.version == 6 else str(address)
     settings = f'listen = "{host}:0"\ndatabase = "state.sqlite"\n'
     config.write_text(settings)
-    assert subprocess.run(init, cwd=root, capture_output=True).returncode != 0
+    existing = subprocess.run(init, cwd=root, capture_output=True, text=True)
+    assert existing.returncode != 0 and existing.stderr.strip() == "Buddy: server.toml already exists"
     assert config.read_text() == settings
     user_a, user_b, other = [root / a for a in ("client-a", "client-b", "other")]
     env = {"BUDDY_ALLOW_FILE_CREDENTIAL": "true"}

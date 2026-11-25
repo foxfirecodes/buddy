@@ -30,7 +30,7 @@ run = [
 ]
 
 [tasks.stage]
-description = "Build the x86-64 Linux host and both clients into server-stage/"
+description = "Stage portable x86-64 Linux and Windows binaries in server-stage/"
 tools = { zig = "0.14.1", "cargo:cargo-zigbuild" = "0.24.1" }
 run = '''
 set -eu
@@ -41,11 +41,10 @@ windows=x86_64-pc-windows-gnullvm
 mise run build:linux
 rustup target add "$windows"
 cargo zigbuild --locked --release -p buddy --target "$windows"
-# Cargo uses the same output path for both Linux glibc targets.
-cargo zigbuild --locked --release -p buddy --target "$linux" --target-dir "$CARGO_TARGET_DIR/stage-host"
 
 mkdir -p server-stage
-install -m 755 "$CARGO_TARGET_DIR/stage-host/$linux/release/buddy" server-stage/buddy
 install -m 755 "$CARGO_TARGET_DIR/$linux/release/buddy" server-stage/buddy-linux-x86_64
 install -m 755 "$CARGO_TARGET_DIR/$windows/release/buddy.exe" server-stage/buddy-windows-x86_64.exe
+# Remove the separate Linux host binary left by older staging runs.
+rm -f -- server-stage/buddy
 '''

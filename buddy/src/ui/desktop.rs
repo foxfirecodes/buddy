@@ -219,10 +219,6 @@ impl App {
 
     pub(super) fn device_menu(&mut self, ui: &mut egui::Ui) {
         ui.add_enabled_ui(!self.busy, |ui| {
-            if ui.button("Add Buddy to Steam…").clicked() {
-                ui.close();
-                self.steam_action(None, Some(true));
-            }
             if self.signed {
                 if ui.button("Approve a device…").clicked() {
                     ui.close();
@@ -240,20 +236,39 @@ impl App {
                         }
                     }
                 });
-                if ui.button("Update from server…").clicked() {
+                ui.separator();
+            }
+            let signed = self.signed;
+            let this_device = |ui: &mut egui::Ui| {
+                if ui.button("Add Buddy to Steam…").clicked() {
                     ui.close();
-                    self.release_action(ReleaseAction::Update, None);
+                    self.steam_action(None, Some(true));
                 }
+                if self.signed {
+                    if ui.button("Update from server…").clicked() {
+                        ui.close();
+                        self.release_action(ReleaseAction::Update, None);
+                    }
+                    if ui.button("Host a server").clicked() {
+                        ui.close();
+                        self.launch_host();
+                    }
+                }
+            };
+            if signed {
+                ui.menu_button("This device", this_device);
+            } else {
+                ui.scope(this_device);
             }
         });
     }
 
     pub(super) fn show_device_dialog(&mut self, ctx: &egui::Context) {
         if self.offer_steam {
-            let response = egui::Modal::new("install-offer".into()).show(ctx, |ui| {
+            let response = phase::modal("install-offer").show(ctx, |ui| {
                 ui.heading("Add Buddy to Steam?");
                 ui.horizontal(|ui| {
-                    let skip = ui.button("Skip").clicked();
+                    let skip = ui.add(phase::quiet("Skip")).clicked();
                     let add = ui
                         .add_enabled(!self.busy, phase::primary("Add to Steam…"))
                         .clicked();
@@ -280,7 +295,7 @@ impl App {
             return;
         };
         let mut retry = None;
-        let response = egui::Modal::new("device-release".into()).show(ctx, |ui| {
+        let response = phase::modal("device-release").show(ctx, |ui| {
             ui.set_max_width((ctx.screen_rect().width() - 60.).clamp(160., 520.));
             match dialog {
                 DeviceDialog::Trust(action, key) => {
@@ -294,7 +309,7 @@ impl App {
                         );
                     });
                     ui.horizontal(|ui| {
-                        let cancel = ui.button("Cancel").clicked();
+                        let cancel = ui.add(phase::quiet("Cancel")).clicked();
                         if ui.add(phase::primary("Codes match · Trust")).clicked() {
                             retry = Some((*action, key.clone()));
                         }
@@ -316,7 +331,7 @@ impl App {
                             );
                         });
                     ui.horizontal(|ui| {
-                        let close = ui.button("Close").clicked();
+                        let close = ui.add(phase::quiet("Close")).clicked();
                         if ui.add(phase::primary("Copy command")).clicked() {
                             ctx.copy_text(command.clone());
                             self.note = "Install command copied".into();

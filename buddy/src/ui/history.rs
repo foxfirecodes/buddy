@@ -53,56 +53,73 @@ impl History {
                     .max_height(220.)
                     .show_rows(ui, height, entries.len(), |ui, rows| {
                         for item in &entries[rows] {
-                            ui.horizontal(|ui| {
-                                let (slot, relative) = logical_path(&item.path);
-                                if let Some(slot) = recipe.slots.get(slot) {
-                                    if slot.ignores_path(relative) {
-                                        ui.weak("Ignored");
-                                    } else if !(item.directory && relative.is_empty()) {
-                                        ui.menu_button("Ignore…", |ui| {
-                                            if ui.button("Ignore on all devices…").clicked() {
-                                                ignore = Some((item.path.clone(), item.directory));
-                                                ui.close();
-                                            }
-                                            for (end, _) in item.path.match_indices('/').rev() {
-                                                let folder = &item.path[..end];
-                                                if folder.contains('/')
-                                                    && ui
-                                                        .button(format!("Ignore {folder}/…"))
-                                                        .clicked()
-                                                {
-                                                    ignore = Some((folder.into(), true));
-                                                    ui.close();
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                                let label = match item.kind {
-                                    ChangeKind::Added => "Added",
-                                    ChangeKind::Modified => "Modified",
-                                    ChangeKind::Removed => "Removed",
-                                    ChangeKind::Present => "Present",
-                                };
-                                ui.weak(label);
-                                let name = if dir.is_empty() {
-                                    item.path.as_str()
-                                } else {
-                                    item.path.rsplit('/').next().unwrap_or(&item.path)
-                                };
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(if item.directory {
-                                            format!("{name}/")
-                                        } else {
-                                            name.to_owned()
-                                        })
-                                        .monospace(),
+                            phase::file_row(
+                                ui,
+                                |ui| {
+                                    let label = match item.kind {
+                                        ChangeKind::Added => "Added",
+                                        ChangeKind::Modified => "Modified",
+                                        ChangeKind::Removed => "Removed",
+                                        ChangeKind::Present => "Present",
+                                    };
+                                    ui.weak(label);
+                                    let name = if dir.is_empty() {
+                                        item.path.as_str()
+                                    } else {
+                                        item.path.rsplit('/').next().unwrap_or(&item.path)
+                                    };
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(if item.directory {
+                                                format!("{name}/")
+                                            } else {
+                                                name.to_owned()
+                                            })
+                                            .monospace(),
+                                        )
+                                        .truncate(),
                                     )
-                                    .truncate(),
-                                )
-                                .on_hover_text(&item.path);
-                            });
+                                    .on_hover_text(&item.path);
+                                },
+                                |ui| {
+                                    let (slot, relative) = logical_path(&item.path);
+                                    if let Some(slot) = recipe.slots.get(slot) {
+                                        if slot.ignores_path(relative) {
+                                            ui.weak("Ignored");
+                                        } else if !(item.directory && relative.is_empty()) {
+                                            phase::overflow_menu(
+                                                ui,
+                                                &format!("Ignore options for {}", item.path),
+                                                |ui| {
+                                                    if ui.button("Ignore on all devices…").clicked()
+                                                    {
+                                                        ignore = Some((
+                                                            item.path.clone(),
+                                                            item.directory,
+                                                        ));
+                                                        ui.close();
+                                                    }
+                                                    for (end, _) in
+                                                        item.path.match_indices('/').rev()
+                                                    {
+                                                        let folder = &item.path[..end];
+                                                        if folder.contains('/')
+                                                            && ui
+                                                                .button(format!(
+                                                                    "Ignore {folder}/…"
+                                                                ))
+                                                                .clicked()
+                                                        {
+                                                            ignore = Some((folder.into(), true));
+                                                            ui.close();
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        }
+                                    }
+                                },
+                            )
                         }
                     });
             };

@@ -105,7 +105,7 @@ struct App {
     password: String,
     device: String,
     invite: String,
-    register: bool,
+    sign_in_method: onboarding::SignInMethod,
     pairing: Option<crate::host::Pairing>,
     private_file: bool,
     games: Vec<Row>,
@@ -258,7 +258,7 @@ impl App {
             password: String::new(),
             device: default_device(),
             invite: String::new(),
-            register: false,
+            sign_in_method: onboarding::SignInMethod::DeviceCode,
             pairing: None,
             private_file: false,
             games: vec![],
@@ -417,21 +417,31 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             phase_heading(ui, "Game library");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("+ Non-Steam game").clicked() {
-                    self.select(format!("custom-{}", id()), String::new());
-                }
+                phase::overflow_menu(ui, "Library options", |ui| {
+                    if ui.button("Add non-Steam game…").clicked() {
+                        ui.close();
+                        self.select(format!("custom-{}", id()), String::new());
+                    }
+                    if self.games.iter().any(|r| r.device == DeviceState::Ready)
+                        && ui.button("Prepare for offline play…").clicked()
+                    {
+                        ui.close();
+                        self.job(|local| Ok(Event::OfflinePicker(offline::Picker::load(&local)?)));
+                    }
+                    ui.separator();
+                    if ui.button("Refresh library").clicked() {
+                        ui.close();
+                        self.artwork = artwork::Artwork::new();
+                        self.refresh();
+                    }
+                });
             });
         });
         ui.add_space(6.);
-        if self.games.iter().any(|r| r.device == DeviceState::Ready)
-            && ui.button("Prepare for offline play…").clicked()
-        {
-            self.job(|local| Ok(Event::OfflinePicker(offline::Picker::load(&local)?)));
-        }
         ui.add(
             egui::TextEdit::singleline(&mut self.filter)
                 .hint_text("Find a game")
-                .desired_width(285.),
+                .desired_width(ui.available_width().min(390.)),
         );
         ui.horizontal_wrapped(|ui| {
             for (filter, label) in [
@@ -532,7 +542,7 @@ impl App {
         }
     }
     fn game(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Back to library").clicked() {
+        if ui.add(phase::quiet("Back to library")).clicked() {
             self.leave_game();
             return;
         }
@@ -663,14 +673,14 @@ impl App {
         if self.detail.as_ref().is_some_and(|d| d.draft) {
             ui.label("Recipe edits queued on this device");
             ui.horizontal(|ui| {
-                if ui.button("Apply edits…").clicked() {
+                if ui.add(phase::primary("Apply edits…")).clicked() {
                     let g = game.clone();
                     self.job(move |l| {
                         setup::review(&l, &g, Interface::Window, false)?;
                         Ok(Event::Done("Recipe edits applied".into()))
                     });
                 }
-                if ui.button("Discard edits…").clicked() {
+                if ui.add(phase::quiet("Discard edits…")).clicked() {
                     let g = game.clone();
                     self.job(move |l| {
                         ensure!(
@@ -696,54 +706,61 @@ impl App {
     }
     fn overview(&mut self, ui: &mut egui::Ui, game: &str) {
         let Some(d) = &self.detail else { return };
+        let enabled = !d.bindings.is_empty();
+        let has_launcher = d.launcher.is_some();
+        let mut sync = false;
+        let mut play = false;
         phase::panel().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.label(RichText::new("Synced locations").strong().size(19.));
-            ui.separator();
-            let live = d
-                .bindings
-                .iter()
-                .filter(|(name, _)| !d.retired_slots.contains(*name));
-            if live.clone().next().is_none() {
-                ui.weak("No locations enabled on this device");
+            ui.weak("Current save");
+            if let Some(current) = d.backups.iter().find(|b| b.head) {
+                ui.label(RichText::new(&current.origin).size(23.).strong());
+                ui.weak(when(current.time));
+            } else {
+                ui.strong(if d.offline {
+                    "Offline"
+                } else {
+                    "No backups yet"
+                });
             }
-            for (name, b) in live {
-                ui.horizontal_wrapped(|ui| {
+            ui.add_space(4.);
+            ui.horizontal_wrapped(|ui| {
+                sync = ui
+                    .add_enabled(enabled, phase::primary("Sync now"))
+                    .clicked();
+                if has_launcher {
+                    play = ui.button("Play").clicked();
+                }
+            });
+        });
+        ui.add_space(6.);
+        let live = d
+            .bindings
+            .iter()
+            .filter(|(name, _)| !d.retired_slots.contains(*name));
+        ui.collapsing(
+            format!("Synced locations ({})", live.clone().count()),
+            |ui| {
+                if live.clone().next().is_none() {
+                    ui.weak("No locations enabled on this device");
+                }
+                for (name, binding) in live {
                     ui.strong(name);
                     ui.add(
                         egui::Label::new(
-                            RichText::new(b.path.display().to_string())
+                            RichText::new(binding.path.display().to_string())
                                 .monospace()
-                                .size(13.)
                                 .color(phase::MUTED),
                         )
                         .wrap(),
                     );
-                });
-            }
-        });
-        if let Some(current) = d.backups.iter().find(|b| b.head) {
-            ui.label(
-                RichText::new(format!(
-                    "Current save  ·  {}  ·  {}",
-                    current.origin,
-                    when(current.time)
-                ))
-                .monospace()
-                .size(13.)
-                .color(phase::MUTED),
-            );
-        }
-        let enabled = !d.bindings.is_empty();
-        ui.add_space(4.);
-        if ui
-            .add_enabled(enabled, phase::primary("Sync now"))
-            .clicked()
-        {
+                }
+            },
+        );
+        ui.collapsing("Steam launch options", |ui| self.launch_fields(ui, game));
+        if sync {
             self.sync(None, false);
-        }
-        if self.detail.as_ref().is_some_and(|d| d.launcher.is_some()) && ui.button("Play").clicked()
-        {
+        } else if play {
             let selected = game.to_owned();
             self.job(move |local| {
                 let status = Command::new(std::env::current_exe()?)
@@ -753,7 +770,6 @@ impl App {
                 Ok(Event::Done(format!("Game closed ({status})")))
             });
         }
-        self.launch_fields(ui, game);
     }
     fn backups(&mut self, ui: &mut egui::Ui, game: &str) {
         ui.horizontal_wrapped(|ui| {
@@ -798,59 +814,11 @@ impl App {
             if rows.peek().is_none() {
                 continue;
             }
-            ui.strong(title);
+            ui.add_space(8.);
+            ui.label(RichText::new(title).size(19.).strong());
             for b in rows {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(format!(
-                        "#{} · {} · {} {} {}",
-                        b.id,
-                        b.origin,
-                        when(b.time),
-                        if b.head { "current" } else { "" },
-                        b.reason
-                    ));
-                    if ui
-                        .selectable_label(
-                            self.history.as_ref().is_some_and(|h| h.matches(game, b.id)),
-                            "What changed?",
-                        )
-                        .clicked()
-                    {
-                        if self.history.as_ref().is_some_and(|h| h.matches(game, b.id)) {
-                            self.history = None;
-                        } else if let Some(d) = &self.detail {
-                            let (account, game, id) =
-                                (d.account_scope.clone(), game.to_owned(), b.id);
-                            self.job(move |local| {
-                                Ok(Event::History(history::History::load(
-                                    &local, &account, game, id,
-                                )?))
-                            });
-                        }
-                    }
-                    if !b.head && ui.small_button("Restore").clicked() {
-                        self.sync(Some(b.id), false);
-                    }
-                    if b.reason.is_empty() && ui.small_button("Keep").clicked() {
-                        self.backup_action(Action::Pin {
-                            game: game.to_owned(),
-                            id: b.id,
-                        });
-                    }
-                    if !b.head && ui.small_button("Delete…").clicked() {
-                        self.backup_action(Action::Delete {
-                            game: game.to_owned(),
-                            id: b.id,
-                        });
-                    }
-                    if b.head && !b.reason.is_empty() && ui.small_button("Remove pin…").clicked()
-                    {
-                        self.backup_action(Action::UnpinCurrent {
-                            game: game.to_owned(),
-                            id: b.id,
-                        });
-                    }
-                });
+                ui.separator();
+                ui.push_id(b.id, |ui| self.backup_row(ui, game, b));
                 if let Some(h) = self.history.as_ref().filter(|h| h.matches(game, b.id))
                     && let Some(d) = self.detail.as_ref()
                     && let Some(recipe) = d.own.as_ref()
@@ -868,8 +836,94 @@ impl App {
             }
         }
     }
+    fn backup_row(&mut self, ui: &mut egui::Ui, game: &str, b: &Backup) {
+        let metadata = |ui: &mut egui::Ui| {
+            ui.strong(&b.origin);
+            let mut detail = format!("{}  ·  #{}", when(b.time), b.id);
+            if !b.reason.is_empty() {
+                detail.push_str("  ·  ");
+                detail.push_str(&b.reason);
+            }
+            ui.weak(detail);
+        };
+        if ui.available_width() >= 470. {
+            ui.horizontal(|ui| {
+                let width = ui.available_width() - 190.;
+                ui.vertical(|ui| {
+                    ui.set_width(width);
+                    metadata(ui);
+                });
+                self.backup_controls(ui, game, b);
+            });
+        } else {
+            metadata(ui);
+            ui.horizontal_wrapped(|ui| self.backup_controls(ui, game, b));
+        }
+    }
+    fn backup_controls(&mut self, ui: &mut egui::Ui, game: &str, b: &Backup) {
+        let inspecting = self.history.as_ref().is_some_and(|h| h.matches(game, b.id));
+        if ui.selectable_label(inspecting, "What changed?").clicked() {
+            if inspecting {
+                self.history = None;
+            } else if let Some(d) = &self.detail {
+                let (account, game, id) = (d.account_scope.clone(), game.to_owned(), b.id);
+                self.job(move |local| {
+                    Ok(Event::History(history::History::load(
+                        &local, &account, game, id,
+                    )?))
+                });
+            }
+        }
+        phase::overflow_menu(ui, &format!("Options for backup #{}", b.id), |ui| {
+            if !b.head && ui.button("Restore…").clicked() {
+                ui.close();
+                self.sync(Some(b.id), false);
+            }
+            if b.reason.is_empty() && ui.button("Keep").clicked() {
+                ui.close();
+                self.backup_action(Action::Pin {
+                    game: game.to_owned(),
+                    id: b.id,
+                });
+            }
+            if !b.head {
+                ui.separator();
+                if ui.button("Delete…").clicked() {
+                    ui.close();
+                    self.backup_action(Action::Delete {
+                        game: game.to_owned(),
+                        id: b.id,
+                    });
+                }
+            } else if !b.reason.is_empty() && ui.button("Remove pin…").clicked() {
+                ui.close();
+                self.backup_action(Action::UnpinCurrent {
+                    game: game.to_owned(),
+                    id: b.id,
+                });
+            }
+        });
+    }
     fn game_settings(&mut self, ui: &mut egui::Ui, game: &str) {
         ui.heading("Game settings");
+        if let Some(d) = &mut self.detail {
+            ui.label(RichText::new("File recipe").size(19.).strong());
+            ui.checkbox(&mut d.shared, "Publish this file recipe to other accounts");
+            ui.horizontal(|ui| {
+                ui.label("Previous versions to keep");
+                ui.add(egui::DragValue::new(&mut d.retention).range(0..=1000));
+            });
+            let (r, s) = (d.retention, d.shared);
+            if ui.add(phase::primary("Save policy")).clicked() {
+                let game = game.to_owned();
+                self.job(move |l| {
+                    setup::policy(&l, &game, Some(r), Some(s))?;
+                    Ok(Event::Done("Policy saved".into()))
+                });
+            }
+        }
+        ui.add_space(8.);
+        ui.separator();
         ui.collapsing("Launch a game directly", |ui| {
             if ui.button("Choose executable…").clicked()
                 && let Some(path) = rfd::FileDialog::new().pick_file()
@@ -905,21 +959,6 @@ impl App {
                 });
             }
         });
-        if let Some(d) = &mut self.detail {
-            ui.checkbox(&mut d.shared, "Publish this file recipe to other accounts");
-            ui.horizontal(|ui| {
-                ui.label("Previous versions to keep");
-                ui.add(egui::DragValue::new(&mut d.retention).range(0..=1000));
-            });
-            let (r, s) = (d.retention, d.shared);
-            if ui.button("Save policy").clicked() {
-                let game = game.to_owned();
-                self.job(move |l| {
-                    setup::policy(&l, &game, Some(r), Some(s))?;
-                    Ok(Event::Done("Policy saved".into()))
-                });
-            }
-        }
     }
     fn sync(&mut self, restore: Option<i64>, pin: bool) {
         let Some(detail) = &self.detail else { return };
@@ -1092,23 +1131,6 @@ impl eframe::App for App {
                                 if !self.signed {
                                     return;
                                 }
-                                ui.separator();
-                                if ui.button("Host a server").clicked() {
-                                    ui.close();
-                                    self.launch_host();
-                                }
-                                if ui
-                                    .add_enabled(!self.busy, egui::Button::new("Refresh"))
-                                    .clicked()
-                                {
-                                    ui.close();
-                                    self.artwork = artwork::Artwork::new();
-                                    if self.selected.is_empty() {
-                                        self.refresh();
-                                    } else {
-                                        self.load();
-                                    }
-                                }
                                 ui.menu_button("Path suggestions", |ui| {
                                     if ui
                                         .add_enabled(
@@ -1143,6 +1165,16 @@ impl eframe::App for App {
                                         }
                                     }
                                 });
+                                if !self.selected.is_empty()
+                                    && ui
+                                        .add_enabled(!self.busy, egui::Button::new("Refresh game"))
+                                        .clicked()
+                                {
+                                    ui.close();
+                                    self.artwork = artwork::Artwork::new();
+                                    self.load();
+                                }
+                                ui.separator();
                                 if ui
                                     .add_enabled(!self.busy, egui::Button::new("Switch account"))
                                     .clicked()

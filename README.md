@@ -46,7 +46,7 @@ The terminal equivalent is `buddy install-command linux-x86_64` or `buddy instal
 
 Linux installs to `~/.local/bin/buddy` by default. If that directory is outside your PATH and `~/bin` is already on it, the installer uses `~/bin`. You can set `XDG_BIN_HOME` to choose another location. If the chosen directory is outside your PATH, the installer prints a command to add it. Windows installs to `%LOCALAPPDATA%\Programs\Buddy\buddy.exe` and adds that directory to the user PATH for new terminals. The installer uses the OS credential store. A headless Linux device can explicitly opt into private-file credentials with `export BUDDY_ALLOW_FILE_CREDENTIAL=true` before running the command.
 
-To roll out a new build, repeat `buddy server publish-release` on the host. On each client choose **Settings → Update from server…** or run `buddy update`. Buddy verifies the release and updates the installed executable in place. Back up the host database and its adjacent `<database filename>.releases` directory together. That directory contains the published binaries and the private signing key clients trust.
+To roll out a new build, repeat `buddy server publish-release` on the host. On each client choose **Settings → This device → Update from server…** or run `buddy update`. Buddy verifies the release and updates the installed executable in place. Back up the host database and its adjacent `<database filename>.releases` directory together. That directory contains the published binaries and the private signing key clients trust.
 
 ## Buddy launch probe
 

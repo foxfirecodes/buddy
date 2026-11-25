@@ -523,36 +523,48 @@ impl Review {
                         .max_height(140.)
                         .show_rows(ui, h, p.files.len(), |ui, r| {
                             for f in &p.files[r] {
-                                ui.horizontal(|ui| {
-                                    ui.menu_button("Ignore…", |ui| {
-                                        if ui.button("Ignore file on all devices").clicked() {
-                                            edit = Some((
-                                                if row.kind == Kind::File {
-                                                    String::new()
-                                                } else {
-                                                    f.clone()
-                                                },
-                                                true,
-                                            ));
-                                            ui.close();
-                                        }
-                                        for (end, _) in f.match_indices('/').rev() {
-                                            let folder = &f[..end];
-                                            if ui
-                                                .button(format!("Ignore folder {folder}/"))
-                                                .clicked()
-                                            {
-                                                edit = Some((folder.to_owned(), true));
-                                                ui.close();
-                                            }
-                                        }
-                                    });
-                                    ui.add(
-                                        egui::Label::new(RichText::new(f).monospace().size(13.))
+                                phase::file_row(
+                                    ui,
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(f).monospace().size(13.),
+                                            )
                                             .truncate(),
-                                    )
-                                    .on_hover_text(f);
-                                });
+                                        )
+                                        .on_hover_text(f);
+                                    },
+                                    |ui| {
+                                        phase::overflow_menu(
+                                            ui,
+                                            &format!("Ignore options for {f}"),
+                                            |ui| {
+                                                if ui.button("Ignore file on all devices").clicked()
+                                                {
+                                                    edit = Some((
+                                                        if row.kind == Kind::File {
+                                                            String::new()
+                                                        } else {
+                                                            f.clone()
+                                                        },
+                                                        true,
+                                                    ));
+                                                    ui.close();
+                                                }
+                                                for (end, _) in f.match_indices('/').rev() {
+                                                    let folder = &f[..end];
+                                                    if ui
+                                                        .button(format!("Ignore folder {folder}/"))
+                                                        .clicked()
+                                                    {
+                                                        edit = Some((folder.to_owned(), true));
+                                                        ui.close();
+                                                    }
+                                                }
+                                            },
+                                        );
+                                    },
+                                )
                             }
                         });
                 }
@@ -619,6 +631,7 @@ impl Review {
                 .then_some(name.clone())
         });
         let mut redo = false;
+        let mut remove = false;
         ui.collapsing("Location options", |ui| {
             if !fixed {
                 ui.label("Selection name");
@@ -630,14 +643,15 @@ impl Review {
             if row.path.is_some() {
                 redo = ui.button("Change location…").clicked();
             }
+            if d.own
+                .as_ref()
+                .is_some_and(|r| r.slots.contains_key(&row.name))
+            {
+                remove = ui
+                    .add_enabled(!d.offline, phase::quiet("Remove from recipe…"))
+                    .clicked();
+            }
         });
-        let remove = d
-            .own
-            .as_ref()
-            .is_some_and(|r| r.slots.contains_key(&row.name))
-            && ui
-                .add_enabled(!d.offline, egui::Button::new("Remove from recipe…"))
-                .clicked();
         let name = row.name.clone();
         if (row.path.is_none() && ui.button("Choose location…").clicked()) || redo {
             let kind = row.kind.clone();

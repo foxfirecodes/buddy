@@ -148,7 +148,7 @@ impl App {
             }
         }
         ui.ctx().request_repaint_after(Duration::from_secs(1));
-        if ui.button("Cancel").clicked() {
+        if ui.add(phase::quiet("Cancel")).clicked() {
             let pending = screen.pending.clone();
             self.join_step = JoinStep::Account { private_only };
             thread::spawn(move || {
@@ -160,7 +160,7 @@ impl App {
     pub(super) fn show_approval_dialog(&mut self, ctx: &egui::Context) {
         let mut lookup = None;
         let mut approval = None;
-        let response = egui::Modal::new("approve-device".into()).show(ctx, |ui| {
+        let response = phase::modal("approve-device").show(ctx, |ui| {
             ui.set_max_width((ctx.screen_rect().width() - 50.).clamp(200., 440.));
             ui.heading("Approve a device");
             if self.error.is_some() {
@@ -200,7 +200,7 @@ impl App {
                     });
                     let code = device_code::normalize(input);
                     ui.horizontal(|ui| {
-                        let cancel = ui.button("Cancel").clicked();
+                        let cancel = ui.add(phase::quiet("Cancel")).clicked();
                         if ui
                             .add_enabled(code.is_some(), phase::primary("Review device"))
                             .clicked()
@@ -221,7 +221,7 @@ impl App {
                     ui.strong(&review.device);
                     ui.label(format!("Sign in to {account} on {server}?"));
                     ui.horizontal(|ui| {
-                        let cancel = ui.button("Cancel").clicked();
+                        let cancel = ui.add(phase::quiet("Cancel")).clicked();
                         if ui.add(phase::primary("Approve")).clicked() {
                             approval = Some((review.clone(), scope.clone()));
                         }

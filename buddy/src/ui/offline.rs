@@ -44,8 +44,8 @@ impl App {
         let mut run = None;
         let mut close = false;
         let mut open = None;
-        egui::Modal::new(egui::Id::new("offline-picker")).show(ctx, |ui| {
-            ui.set_max_width(520.);
+        phase::modal("offline-picker").show(ctx, |ui| {
+            ui.set_max_width((ctx.screen_rect().width() - 48.).clamp(120., 520.));
             ui.heading("Prepare for offline play");
             ui.weak("Prepared games open without asking when the server is unreachable.");
             ui.add_space(8.);
@@ -87,7 +87,8 @@ impl App {
                         });
                     }
                 });
-            ui.horizontal(|ui| {
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
                 if self.busy {
                     ui.spinner();
                 }
@@ -109,9 +110,7 @@ impl App {
                     }
                     run = Some((picker.scope.clone(), games));
                 }
-                close = ui
-                    .add_enabled(!self.busy, egui::Button::new("Done"))
-                    .clicked();
+                close = ui.add_enabled(!self.busy, phase::quiet("Done")).clicked();
             });
         });
         if let Some((scope, games)) = run {

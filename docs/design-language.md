@@ -27,6 +27,10 @@ Use the wide, low Buddy wordmark for the brand. Use a legible proportional sans 
 
 ## Layout and interaction
 
+Let the task set the hierarchy. Library search and filters stay visible. Put occasional library operations in a **…** menu beside the library title. Lead a game overview with the current save and **Sync now**. Keep file paths and Steam setup expandable. In backup lists, show the source device and time alongside **What changed?** and group changes to a revision in a trailing **…** menu.
+
+Give each overflow button a contextual tooltip and keyboard focus. Use quiet, full-size controls for back, cancel and dismissal. Show their outline on hover or keyboard focus. Keep recovery choices, trust checks and confirmation consequences visible at the decision.
+
 Use flat charcoal surfaces, thin borders and softly squared corners. Group related controls with roughly 8 points of space, and leave 16–24 points between sections. Keep orange concentrated around the next action or the current selection. Pair important states with text or a recognizable mark so color alone never carries the decision.
 
 Let rows wrap and comparison panels stack when space is tight. Keep values selectable where players may need to copy them. Focus must remain visible with a keyboard. Give controls short verb labels such as **Save setup** and **Decide later**. Add explanatory copy when it helps someone judge a consequence, identify a save, or recover from a failure.

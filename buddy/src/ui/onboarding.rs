@@ -8,6 +8,13 @@ use crate::{
 use eframe::egui;
 use std::{path::Path, process::Command};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SignInMethod {
+    DeviceCode,
+    Password,
+    Invite,
+}
+
 pub(super) enum JoinStep {
     Opening,
     Welcome,
@@ -195,7 +202,7 @@ impl App {
     }
 
     fn join_server(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Back").clicked() {
+        if ui.add(phase::quiet("Back")).clicked() {
             self.note.clear();
             self.join_step = JoinStep::Welcome;
             return;
@@ -252,44 +259,64 @@ impl App {
     }
 
     fn account_form(&mut self, ui: &mut egui::Ui, private_only: bool) {
-        if ui.button("Change server").clicked() {
+        let method = self.sign_in_method;
+        let register = method == SignInMethod::Invite;
+        if method == SignInMethod::DeviceCode {
+            if ui.add(phase::quiet("Change server")).clicked() {
+                self.password.clear();
+                self.invite.clear();
+                self.note.clear();
+                self.pairing = None;
+                self.join_step = JoinStep::Server;
+                return;
+            }
+        } else if ui.add(phase::quiet("Back")).clicked() {
             self.password.clear();
             self.invite.clear();
             self.note.clear();
-            self.pairing = None;
-            self.join_step = JoinStep::Server;
+            self.error = None;
+            self.sign_in_method = SignInMethod::DeviceCode;
             return;
         }
         phase_heading(
             ui,
-            if self.register {
+            if register {
                 "Create account"
             } else {
                 "Sign in"
             },
         );
-        phase::panel().show(ui, |ui| {
-            ui.strong(&self.url);
-            if let Some(pair) = &self.pairing {
-                ui.weak("Compare this fingerprint with the host");
-                ui.monospace(pair.fingerprint());
-            }
-        });
-        if !self.register
-            && ui
+        ui.weak(&self.url);
+        if let Some(pair) = &self.pairing {
+            ui.label("Compare this fingerprint with the host");
+            ui.monospace(pair.fingerprint());
+        }
+        ui.add_space(6.);
+        if method == SignInMethod::DeviceCode {
+            if ui
                 .add_sized(
                     [ui.available_width(), 46.],
                     phase::primary("Sign in with a device code"),
                 )
                 .clicked()
-        {
-            self.start_device_code(private_only);
+            {
+                self.start_device_code(private_only);
+                return;
+            }
+            ui.collapsing("Device name", |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.device).desired_width(f32::INFINITY));
+            });
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Use a password").clicked() {
+                    self.sign_in_method = SignInMethod::Password;
+                }
+                if ui.add(phase::quiet("Use an invite")).clicked() {
+                    self.sign_in_method = SignInMethod::Invite;
+                }
+            });
             return;
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut self.register, false, "Existing account");
-            ui.selectable_value(&mut self.register, true, "Use an invite");
-        });
         ui.label("Account");
         ui.add(egui::TextEdit::singleline(&mut self.account).desired_width(f32::INFINITY));
         ui.label("Password");
@@ -300,7 +327,7 @@ impl App {
         );
         ui.label("Device name");
         ui.add(egui::TextEdit::singleline(&mut self.device).desired_width(f32::INFINITY));
-        if self.register {
+        if register {
             ui.label("Invite");
             ui.add(egui::TextEdit::singleline(&mut self.invite).desired_width(f32::INFINITY));
         }
@@ -317,8 +344,8 @@ impl App {
         let ready = !self.account.trim().is_empty()
             && !self.password.is_empty()
             && !self.device.trim().is_empty()
-            && (!self.register || !self.invite.trim().is_empty());
-        let action = match (self.register, private_only) {
+            && (!register || !self.invite.trim().is_empty());
+        let action = match (register, private_only) {
             (false, true) => "Sign in and save token",
             (true, true) => "Create account and save token",
             (false, false) => "Sign in",
@@ -330,7 +357,7 @@ impl App {
                 account: self.account.clone(),
                 password: std::mem::take(&mut self.password),
                 device: self.device.clone(),
-                invite: self.register.then(|| std::mem::take(&mut self.invite)),
+                invite: register.then(|| std::mem::take(&mut self.invite)),
             };
             let private_file = private_only || self.private_file;
             let pairing = self.pairing.clone();
@@ -365,7 +392,7 @@ impl App {
             }
         }
         if ui.button("Sign in again").clicked() {
-            self.register = false;
+            self.sign_in_method = SignInMethod::DeviceCode;
             self.open_account_form();
         }
     }
@@ -384,14 +411,14 @@ impl App {
                 self.job(move |local| save_sign_in(&local, credentials, private));
             }
             if ui.button("Cancel").clicked() {
-                self.note = if self.register {
+                self.note = if self.sign_in_method == SignInMethod::Invite {
                     "Account created. Sign in to finish on this device."
                 } else {
                     "Sign-in wasn’t saved on this device."
                 }
                 .into();
                 self.error = None;
-                self.register = false;
+                self.sign_in_method = SignInMethod::DeviceCode;
                 self.join_step = JoinStep::Account { private_only };
             }
         });
@@ -405,7 +432,7 @@ impl App {
         self.account.clear();
         self.password.clear();
         self.invite.clear();
-        self.register = false;
+        self.sign_in_method = SignInMethod::DeviceCode;
         self.note.clear();
         self.open_account_form();
     }

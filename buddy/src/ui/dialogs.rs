@@ -270,7 +270,7 @@ fn conflict(
     label(ui, "Both versions have permanent backups.");
     ui.add_space(8.);
     ui.horizontal_wrapped(|ui| {
-        let later = ui.button("Decide later");
+        let later = ui.add(phase::quiet("Decide later"));
         let apply = ui.add_enabled(*selected < 2, phase::primary("Use this save"));
         if initial || navigation.is_some() || new_selection.is_some() {
             if *selected == 2 {

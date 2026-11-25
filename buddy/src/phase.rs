@@ -115,6 +115,45 @@ pub fn primary(label: &str) -> egui::Button<'static> {
     egui::Button::new(RichText::new(label).strong().color(ACCENT_INK)).fill(ORANGE)
 }
 
+/// Secondary navigation and dismissals keep their full hit area and focus outline.
+pub fn quiet(label: &str) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(label).color(MUTED)).frame_when_inactive(false)
+}
+
+/// Keep filenames aligned while giving trailing controls room before truncating the path.
+pub fn file_row(ui: &mut Ui, filename: impl FnOnce(&mut Ui), trailing: impl FnOnce(&mut Ui)) {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            trailing(ui);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), filename);
+        });
+    });
+}
+
+pub fn overflow_menu(ui: &mut Ui, label: &str, items: impl FnOnce(&mut Ui)) {
+    let button = egui::Button::new("")
+        .frame_when_inactive(false)
+        .min_size(vec2(44., ui.spacing().interact_size.y));
+    let (response, popup) = egui::containers::menu::MenuButton::from_button(button).ui(ui, items);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label)
+    });
+    let color = if response.hovered() || response.has_focus() || popup.is_some() {
+        TEXT
+    } else {
+        MUTED
+    };
+    for offset in [-6., 0., 6.] {
+        ui.painter()
+            .circle_filled(response.rect.center() + vec2(offset, 0.), 1.7, color);
+    }
+    response.on_hover_text(label);
+}
+
+pub fn modal(id: &'static str) -> egui::Modal {
+    egui::Modal::new(Id::new(id)).frame(panel().inner_margin(18))
+}
+
 pub fn panel() -> egui::Frame {
     egui::Frame::new()
         .fill(PANEL)

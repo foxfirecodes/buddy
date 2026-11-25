@@ -1,6 +1,6 @@
 # First Play with Proton
 
-On a Linux device with an existing account recipe, select the installed Steam game in Buddy and use **Copy launch options**. Paste the text in the game’s Steam properties, preserving existing launch flags as described in the [sync walkthrough](sync.md). Press **Play** in Steam.
+On a Linux device with an existing account recipe, select the installed Steam game in Buddy. During setup open **First Play with Proton → Copy launch options**. For a configured game use **Overview → Steam launch options → Copy launch options**. Paste the text in the game’s Steam properties, preserving existing launch flags as described in the [sync walkthrough](sync.md). Press **Play** in Steam.
 
 If Steam selected an empty prefix, Buddy shows its path and offers **Initialize prefix**. It runs the selected Steam Linux Runtime and Proton’s `getcompatpath` operation. This prepares the Windows profile before the game opens. A prefix on a secondary library or an explicit `STEAM_COMPAT_DATA_PATH` works the same way.
 

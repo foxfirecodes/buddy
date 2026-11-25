@@ -11,7 +11,7 @@
 
 In Buddy, choose **Join a server**. On the host computer, choose **Use my hosted server**. On another device, choose **Open pairing file…** and select the exported JSON. Compare the address and certificate fingerprint with the ones in the host window. For a manually configured HTTP server or a server using a system-trusted HTTPS certificate, expand **Enter server address** and enter its URL. [Headless server setup](sync.md#start-a-server-and-sign-in)
 
-Choose **Use an invite** on the first device. Enter the invite, account name, password, and device name and choose **Create account**. On the second device, sign into the same account and give the device a different name. A second player can create a separate account using their own invite.
+Choose **Use an invite** on the first device. Enter the invite, account name, password, and device name and choose **Create account**. On the second device, choose **Sign in with a device code** and approve the code from **Settings → Approve a device…** on the first. Expand **Device name** before requesting the code if you want to rename it. **Use a password** also signs in an existing account. A second player can create a separate account using their own invite.
 
 On Linux, if the session has no Secret Service provider, Buddy shows where it will keep the device token. Choose **Sign in and save token** or **Create account and save token** to store it in Buddy’s private app data. If a credential store is available but a write fails, you can retry it or choose private app data using the same sign-in. For a previously saved account, unlock the store and choose **Retry after unlocking** when prompted. Buddy only uses your password to sign in.
 
@@ -21,7 +21,7 @@ The CLI supports `buddy login SERVER_URL ACCOUNT --pairing PATH_TO_PAIRING_FILE`
 
 ## Pick files for a game
 
-Search **Game library** by title, including games installed in additional Steam libraries. **Server recipes** shows games with a file layout from your account or a recipe another player explicitly shared. Open the game or choose **+ Non-Steam game**. An enrolled game opens its overview. Choose **Edit files** to change this device’s selection.
+Search **Game library** by title, including games installed in additional Steam libraries. **Server recipes** shows games with a file layout from your account or a recipe another player explicitly shared. Open the game or choose **Game library → … → Add non-Steam game…**. An enrolled game opens its overview. Choose **Edit files** to change this device’s selection.
 
 For a new game, review **Files to sync**. Buddy uses your account’s existing layout when available. When other players have shared recipes, the **File recipe** menu lets you choose theirs or use **Detected locations**. A recipe identifies locations. Map its roots above the location list, then select the locations to sync on this device. Each player’s saves stay private.
 
@@ -33,13 +33,13 @@ For broader path suggestions, **Settings → Path suggestions → Download from 
 
 ## Connect a game to Steam
 
-Open the game in Buddy and choose **Manage in Steam…**. Pick the Steam account if more than one uses this device. When prompted, choose **Steam → Exit**, then continue in Buddy. Review the original and proposed launch fields and confirm the change. Reopen Steam and press **Play**. Run Buddy directly from Desktop Mode for this step on Deck so its window stays open when Steam exits.
+On the game overview, open **Steam launch options → Manage in Steam…**. Pick the Steam account if more than one uses this device. When prompted, choose **Steam → Exit**, then continue in Buddy. Review the original and proposed launch fields and confirm the change. Reopen Steam and press **Play**. Run Buddy directly from Desktop Mode for this step on Deck so its window stays open when Steam exits.
 
 For a store game, Buddy adds its wrapper to Launch Options. Simple arguments and a wrapper such as `mangohud %command%` carry through. For an existing native non-Steam shortcut, Buddy updates Target and Launch Options while retaining Start In and the shortcut ID. On Linux, a Windows executable or a shortcut with a Steam compatibility tool keeps its target so Steam can start the selected runtime. For a manually configured game, save its launcher in Buddy first. The new Steam shortcut then uses that launcher's executable, working directory and arguments. For sandboxed Steam installations, Steam needs access to the installed Buddy binary and selected files.
 
 Choose **Manage in Steam…** again to uninstall. Buddy shows later changes to the managed fields before restoring the originals. Removing a shortcut that Buddy created removes its library entry. If you've customized that shortcut, Buddy leaves the entry for you to review in Steam. Removing the integration leaves your saves and recipe on disk.
 
-To add Buddy itself to the library, open the top-right **Settings → Add Buddy to Steam…**. An existing matching shortcut can stay in place. The same actions are available under `buddy steam --help`.
+To add Buddy itself to the library, open the top-right **Settings → This device → Add Buddy to Steam…**. An existing matching shortcut can stay in place. The same actions are available under `buddy steam --help`.
 
 ## Trial results
 
